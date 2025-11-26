@@ -62,8 +62,18 @@ macro_rules! new_any {
 }
 
 lazy_static! {
-    pub static ref STREAMING_SERVICE: Service = Service {
-        ios: Arc::new(Mutex::new(HashMap::default()))
+    pub static ref STREAMING_SERVICE: Service = {
+        let service = Service {
+            ios: Arc::new(Mutex::new(HashMap::default()))
+        };
+        // Start a background task to periodically clean up unused channels
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                service.cleanup_unused_channels().await;
+            }
+        });
+        service
     };
 }
 
@@ -116,6 +126,28 @@ impl IOChannel {
             remaining_data: None,
             preemption_sender: None,
             notifier: Arc::new(Notify::new()),
+        }
+    }
+    
+    // Method to properly clean up all resources
+    pub fn cleanup(&mut self) {
+        // Clear any remaining data
+        self.remaining_data = None;
+        
+        // Close sender and receiver to release file descriptors
+        if let Some(sender) = self.sender.take() {
+            // Dropping the sender will close the channel
+            drop(sender);
+        }
+        
+        if let Some(receiver) = self.receiver.take() {
+            // Dropping the receiver will close the channel
+            drop(receiver);
+        }
+        
+        // Clean up preemption sender if exists
+        if let Some(preempt_sender) = self.preemption_sender.take() {
+            drop(preempt_sender);
         }
     }
 
@@ -265,7 +297,10 @@ impl Service {
     }
 
     async fn remove_io_channel(&self, id: &str) {
-        self.ios.lock().await.remove(id);
+        // Ensure proper cleanup of the channel and its resources
+        if let Some(mut channel) = self.ios.lock().await.remove(id) {
+            channel.cleanup();
+        }
     }
 
     async fn handle_stdin(
@@ -275,7 +310,7 @@ impl Service {
     ) -> ttrpc::Result<()> {
         let sender = self.get_or_insert_sender(stream_id).await?;
         let mut window = 0i32;
-        loop {
+        let result = loop {
             if window < WINDOW_SIZE {
                 let mut update = WindowUpdate::new();
                 update.update = WINDOW_SIZE;
@@ -286,7 +321,7 @@ impl Service {
                         if let Some(c) = self.ios.lock().await.get_mut(stream_id) {
                             c.sender = Some(sender);
                         }
-                        return Err(ttrpc::Error::Others(format!("failed to write data {}", e)));
+                        break Err(ttrpc::Error::Others(format!("failed to write data {}", e)));
                     }
                 };
                 let a = new_any!(WindowUpdate, update_bytes);
@@ -295,12 +330,12 @@ impl Service {
                     if let Some(c) = self.ios.lock().await.get_mut(stream_id) {
                         c.sender = Some(sender);
                     }
-                    return Err(e);
+                    break Err(e);
                 }
                 window += WINDOW_SIZE;
             }
-            match stream.recv().await? {
-                Some(d) => {
+            match stream.recv().await {
+                Ok(Some(d)) => {
                     let data_bytes = {
                         let mut data = Data::new();
                         let mut input = CodedInputStream::from_bytes(d.value.as_slice());
@@ -310,16 +345,24 @@ impl Service {
                     };
                     let len: i32 = data_bytes.len().try_into().unwrap_or_default();
                     if let Err(e) = sender.send(data_bytes).await {
-                        return Err(ttrpc::Error::Others(format!("failed to send data {}", e)));
+                        break Err(ttrpc::Error::Others(format!("failed to send data {}", e)));
                     }
                     window -= len;
                 }
-                None => {
-                    self.ios.lock().await.remove(stream_id);
-                    return Ok(());
+                Ok(None) => {
+                    // Stream ended normally
+                    break Ok(());
+                }
+                Err(e) => {
+                    // Stream error
+                    break Err(e);
                 }
             }
-        }
+        };
+        
+        // Clean up the channel when done
+        self.ios.lock().await.remove(stream_id);
+        result
     }
 
     async fn handle_stdout(
@@ -333,22 +376,26 @@ impl Service {
                 debug!("failed to send data of stream {}, {}", stream_id, e);
                 self.return_preempted_receiver(stream_id, receiver, Some(a))
                     .await;
+                // Clean up the channel on error
+                self.ios.lock().await.remove(stream_id);
                 return Err(e);
             }
         }
-        loop {
+        let result = loop {
             let r = if let Ok(res) = receiver.recv().await {
                 res
             } else {
                 self.return_preempted_receiver(stream_id, receiver, None)
                     .await;
                 info!("stream {} is preempted", stream_id);
-                return Err(ttrpc::Error::Others("channel is preempted".to_string()));
+                // Clean up the channel on preemption
+                self.ios.lock().await.remove(stream_id);
+                break Err(ttrpc::Error::Others("channel is preempted".to_string()));
             };
             match r {
                 Some(d) => {
                     if d.is_empty() {
-                        return Ok(());
+                        break Ok(());
                     }
                     let mut data = Data::new();
                     data.data = d;
@@ -358,7 +405,9 @@ impl Service {
                             debug!("failed to marshal data of stream {}, {}", stream_id, e);
                             self.return_preempted_receiver(stream_id, receiver, None)
                                 .await;
-                            return Err(ttrpc::Error::Others(format!(
+                            // Clean up the channel on error
+                            self.ios.lock().await.remove(stream_id);
+                            break Err(ttrpc::Error::Others(format!(
                                 "failed to write data {}",
                                 e
                             )));
@@ -371,13 +420,43 @@ impl Service {
                             debug!("failed to send data of stream {}, {}", stream_id, e);
                             self.return_preempted_receiver(stream_id, receiver, Some(a))
                                 .await;
-                            return Err(e);
+                            // Clean up the channel on error
+                            self.ios.lock().await.remove(stream_id);
+                            break Err(e);
                         }
                     };
                 }
                 None => {
-                    return Ok(());
+                    break Ok(());
                 }
+            }
+        };
+        
+        // Ensure cleanup even if we exit normally
+        self.ios.lock().await.remove(stream_id);
+        result
+    }
+
+    // Periodically clean up unused channels to prevent resource leaks
+    async fn cleanup_unused_channels(&self) {
+        let mut ios = self.ios.lock().await;
+        let mut to_remove = Vec::new();
+        
+        // Identify channels that are no longer in use
+        for (id, channel) in ios.iter() {
+            // If both sender and receiver are taken, the channel is likely in use
+            // If they're still present, check if they have been inactive for a while
+            if channel.sender.is_none() && channel.receiver.is_none() {
+                // Channel is likely abandoned, mark for removal
+                to_remove.push(id.clone());
+            }
+        }
+        
+        // Remove identified channels
+        for id in to_remove {
+            if let Some(mut channel) = ios.remove(&id) {
+                debug!("Cleaning up abandoned channel: {}", id);
+                channel.cleanup();
             }
         }
     }
@@ -436,7 +515,7 @@ impl AsyncRead for StreamingStdin {
     }
 }
 
-type Permit = Box<dyn Future<Output = Result<OwnedPermit<Vec<u8>>, SendError<()>>> + Send>;
+type Permit = Box<dyn Future<Output = Result<OwnedPermit<Vec<u8>>, SendError<()>>> + Send;
 
 pin_project_lite::pin_project! {
     pub struct StreamingOutput {

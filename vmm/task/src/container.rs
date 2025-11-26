@@ -492,18 +492,43 @@ impl ProcessLifecycle<ExecProcess> for KuasarExecLifecycle {
             exec_opts.io = pio.io.as_ref().cloned();
             (None, Some(pio))
         };
+        
+        // Store cleanup resources in case of failure
+        let cleanup_socket = socket.clone();
+        let cleanup_pio = pio.clone();
+        let cleanup_bundle = bundle.clone();
+        let cleanup_pid_path = pid_path.clone();
+        let cleanup_exit_signal = p.lifecycle.exit_signal.clone();
+        
         //TODO  checkpoint support
         let exec_result = self
             .runtime
             .exec(&self.container_id, &self.spec, Some(&exec_opts))
             .await;
+            
         if let Err(e) = exec_result {
-            if let Some(s) = socket {
+            // Clean up resources on exec failure to prevent fd leak
+            if let Some(s) = cleanup_socket {
                 s.clean().await;
             }
-            return Err(runtime_error(&bundle, e, "OCI runtime exec failed").await);
+            
+            // Remove the pid file if it was created
+            if cleanup_pid_path.exists() {
+                let _ = remove_file(&cleanup_pid_path).await;
+            }
+            
+            // Signal exit to clean up any pending IO operations
+            cleanup_exit_signal.signal();
+            
+            return Err(runtime_error(&cleanup_bundle, e, "OCI runtime exec failed").await);
         }
-        copy_io_or_console(p, socket, pio, p.lifecycle.exit_signal.clone()).await?;
+        
+        // Only proceed with IO copying if exec succeeded
+        if let Err(e) = copy_io_or_console(p, socket, pio, p.lifecycle.exit_signal.clone()).await {
+            // If IO copying fails, we still need to clean up
+            p.lifecycle.exit_signal.signal();
+            return Err(e);
+        }
         let pid = read_file_to_str(pid_path).await?.parse::<i32>()?;
         p.pid = pid;
         p.state = Status::RUNNING;
@@ -538,6 +563,19 @@ impl ProcessLifecycle<ExecProcess> for KuasarExecLifecycle {
         self.exit_signal.signal();
         let exec_pid_path = Path::new(self.bundle.as_str()).join(format!("{}.pid", p.id));
         remove_file(exec_pid_path).await.unwrap_or_default();
+        
+        // Also clean up any associated IO resources
+        if let Some(ref console) = p.console {
+            // Close console file descriptor
+            let _ = nix::unistd::close(console.file.as_raw_fd());
+        }
+        
+        // Clear stdin if it exists
+        if let Some(ref mut stdin) = p.stdin {
+            let mut guard = stdin.lock().await;
+            *guard = None;
+        }
+        
         Ok(())
     }
 

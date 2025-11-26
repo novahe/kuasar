@@ -434,9 +434,30 @@ async fn create_ttrpc_server() -> anyhow::Result<Server> {
 
     let streaming_service = create_streaming(Arc::new(Box::new(STREAMING_SERVICE.clone())));
 
-    Ok(Server::new()
+    let server = Server::new()
         .bind("vsock://-1:1024")?
         .register_service(task_service)
         .register_service(sandbox_service)
-        .register_service(streaming_service))
+        .register_service(streaming_service);
+        
+    Ok(server)
+}
+
+async fn run_ttrpc_server() -> anyhow::Result<()> {
+    let mut server = create_ttrpc_server().await?;
+    
+    info!("Starting ttrpc server on vsock://-1:1024");
+    server.start().await.map_err(|e| anyhow!("failed to start ttrpc server: {}", e))?;
+    
+    // Wait for shutdown signal
+    tokio::signal::ctrl_c().await?;
+    
+    info!("Shutting down ttrpc server");
+    // Gracefully shutdown the server and clean up all resources
+    server.shutdown().await.map_err(|e| anyhow!("failed to shutdown ttrpc server: {}", e))?;
+    
+    // Give some time for cleanup
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    
+    Ok(())
 }
