@@ -54,6 +54,10 @@ async fn main() {
         signal::handle_signals(&log_level, service_name).await;
     });
 
+    tokio::spawn(async move {
+        vmm_sandboxer::watchdog::run_watchdog().await;
+    });
+
     // Do recovery job
     if Path::new(&args.dir).exists() {
         sandboxer.recover(&args.dir).await;

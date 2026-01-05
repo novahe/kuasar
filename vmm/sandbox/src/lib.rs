@@ -36,3 +36,4 @@ pub mod sandbox;
 pub mod stratovirt;
 pub mod utils;
 pub mod version;
+pub mod watchdog;

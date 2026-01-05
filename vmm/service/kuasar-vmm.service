@@ -3,10 +3,12 @@ Description=Kuasar microVM type sandboxer daemon process
 After=network.target
 
 [Service]
-Type=simple
+Type=notify
 EnvironmentFile=-/etc/sysconfig/kuasar-vmm
 ExecStart=/usr/local/bin/vmm-sandboxer $OPTIONS
 ExecReload=/bin/kill -s HUP $MAINPID
+WatchdogSec=180
+TimeoutStartSec=300
 LimitNOFILE=1048576
 LimitNPROC=infinity
 LimitCORE=infinity
