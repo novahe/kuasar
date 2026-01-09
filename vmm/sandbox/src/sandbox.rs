@@ -33,7 +33,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::{
     fs::{copy, create_dir_all, remove_dir_all, OpenOptions},
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{Mutex, RwLock},
+    sync::{Mutex, RwLock, Semaphore},
 };
 use tracing::instrument;
 use ttrpc::context::with_timeout;
@@ -94,35 +94,59 @@ where
                 return;
             }
         };
+
+        let mut entries = Vec::new();
         while let Some(entry) = subs.next_entry().await.unwrap() {
+            entries.push(entry);
+        }
+
+        const RECOVERY_CONCURRENCY: usize = 32;
+        let semaphore = Arc::new(Semaphore::new(RECOVERY_CONCURRENCY));
+        let mut handles = Vec::with_capacity(entries.len());
+
+        for entry in entries {
             if let Ok(t) = entry.file_type().await {
                 if !t.is_dir() {
                     continue;
                 }
-                debug!("recovering sandbox {:?}", entry.file_name());
-                let path = Path::new(dir).join(entry.file_name());
-                match KuasarSandbox::recover(&path).await {
-                    Ok(sb) => {
-                        let status = sb.status.clone();
-                        let sb_mutex = Arc::new(Mutex::new(sb));
-                        // Only running sandbox should be monitored.
-                        if let SandboxStatus::Running(_) = status {
-                            let sb_clone = sb_mutex.clone();
-                            monitor(sb_clone);
+                let dir_path = dir.to_string();
+                let sandboxes = self.sandboxes.clone();
+                let permit = semaphore.clone().acquire_owned().await.unwrap();
+
+                let handle = tokio::spawn(async move {
+                    let _permit = permit;
+                    debug!("recovering sandbox {:?}", entry.file_name());
+                    let path = Path::new(&dir_path).join(entry.file_name());
+                    match KuasarSandbox::recover(&path).await {
+                        Ok(sb) => {
+                            let status = sb.status.clone();
+                            let sb_mutex = Arc::new(Mutex::new(sb));
+                            // Only running sandbox should be monitored.
+                            if let SandboxStatus::Running(_) = status {
+                                let sb_clone = sb_mutex.clone();
+                                monitor(sb_clone);
+                            }
+                            sandboxes
+                                .write()
+                                .await
+                                .insert(entry.file_name().to_str().unwrap().to_string(), sb_mutex);
                         }
-                        self.sandboxes
-                            .write()
-                            .await
-                            .insert(entry.file_name().to_str().unwrap().to_string(), sb_mutex);
+                        Err(e) => {
+                            warn!("failed to recover sandbox {:?}, {:?}", entry.file_name(), e);
+                            cleanup_mounts(path.to_str().unwrap())
+                                .await
+                                .unwrap_or_default();
+                            remove_dir_all(&path).await.unwrap_or_default();
+                        }
                     }
-                    Err(e) => {
-                        warn!("failed to recover sandbox {:?}, {:?}", entry.file_name(), e);
-                        cleanup_mounts(path.to_str().unwrap())
-                            .await
-                            .unwrap_or_default();
-                        remove_dir_all(&path).await.unwrap_or_default();
-                    }
-                }
+                });
+                handles.push(handle);
+            }
+        }
+
+        for handle in handles {
+            if let Err(e) = handle.await {
+                error!("recovery task join error: {}", e);
             }
         }
     }
