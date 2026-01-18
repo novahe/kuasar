@@ -14,7 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, io::ErrorKind, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    env,
+    io::ErrorKind,
+    path::Path,
+    sync::Arc,
+    time::Instant,
+};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -33,7 +40,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::{
     fs::{copy, create_dir_all, remove_dir_all, OpenOptions},
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{Mutex, RwLock},
+    sync::{Mutex, RwLock, Semaphore},
 };
 use tracing::instrument;
 use ttrpc::context::with_timeout;
@@ -87,6 +94,15 @@ where
 {
     #[instrument(skip_all)]
     pub async fn recover(&mut self, dir: &str) {
+        // Get recovery concurrency from environment variable, default to 32
+        const DEFAULT_RECOVERY_CONCURRENCY: usize = 32;
+        let recovery_concurrency = env::var("KUASAR_RECOVERY_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_RECOVERY_CONCURRENCY);
+
+        let start_time = Instant::now();
+
         let mut subs = match tokio::fs::read_dir(dir).await {
             Ok(subs) => subs,
             Err(e) => {
@@ -94,37 +110,140 @@ where
                 return;
             }
         };
-        while let Some(entry) = subs.next_entry().await.unwrap() {
-            if let Ok(t) = entry.file_type().await {
-                if !t.is_dir() {
-                    continue;
-                }
-                debug!("recovering sandbox {:?}", entry.file_name());
-                let path = Path::new(dir).join(entry.file_name());
-                match KuasarSandbox::recover(&path).await {
-                    Ok(sb) => {
-                        let status = sb.status.clone();
-                        let sb_mutex = Arc::new(Mutex::new(sb));
-                        // Only running sandbox should be monitored.
-                        if let SandboxStatus::Running(_) = status {
-                            let sb_clone = sb_mutex.clone();
-                            monitor(sb_clone);
-                        }
-                        self.sandboxes
-                            .write()
-                            .await
-                            .insert(entry.file_name().to_str().unwrap().to_string(), sb_mutex);
-                    }
-                    Err(e) => {
-                        warn!("failed to recover sandbox {:?}, {:?}", entry.file_name(), e);
-                        cleanup_mounts(path.to_str().unwrap())
-                            .await
-                            .unwrap_or_default();
-                        remove_dir_all(&path).await.unwrap_or_default();
-                    }
+
+        // Collect entries with proper error handling
+        let mut entries = Vec::new();
+        loop {
+            match subs.next_entry().await {
+                Ok(Some(entry)) => entries.push(entry),
+                Ok(None) => break,
+                Err(e) => {
+                    warn!("Failed to read directory entry: {}, stopping recovery scan", e);
+                    break;
                 }
             }
         }
+
+        let total_entries = entries.len();
+        if total_entries == 0 {
+            info!("No sandbox entries found for recovery in {}", dir);
+            return;
+        }
+
+        info!(
+            "Starting recovery of {} sandboxes with concurrency {}",
+            total_entries, recovery_concurrency
+        );
+
+        let semaphore = Arc::new(Semaphore::new(recovery_concurrency));
+        let mut handles = Vec::with_capacity(entries.len());
+
+        for (index, entry) in entries.into_iter().enumerate() {
+            // Log progress every 10 entries
+            if index > 0 && index % 10 == 0 {
+                debug!("Recovery progress: {}/{} entries processed", index, total_entries);
+            }
+
+            let file_type = match entry.file_type().await {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!("Failed to get file type for {:?}: {}", entry.file_name(), e);
+                    continue;
+                }
+            };
+
+            if !file_type.is_dir() {
+                continue;
+            }
+
+            // Handle non-UTF8 filenames gracefully
+            let file_name = match entry.file_name().to_str() {
+                Some(name) => name.to_string(),
+                None => {
+                    warn!(
+                        "Skipping sandbox with non-UTF8 name: {:?}",
+                        entry.file_name()
+                    );
+                    continue;
+                }
+            };
+
+            // Acquire semaphore permit with error handling
+            let permit = match semaphore.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("Failed to acquire semaphore permit for {}: {}, skipping", file_name, e);
+                    continue;
+                }
+            };
+
+            let entry_name = file_name.clone();
+
+            // Clone for each task (necessary for async move ownership)
+            let dir_path_clone = dir.to_string();
+            let sandboxes_clone = self.sandboxes.clone();
+            let entry_name_for_handle = entry_name.clone();
+
+            let handle = tokio::spawn(async move {
+                let _permit = permit; // Released when _permit goes out of scope
+                debug!("recovering sandbox {}", entry_name);
+
+                let path = Path::new(&dir_path_clone).join(&entry_name);
+                match KuasarSandbox::recover(&path).await {
+                    Ok(sb) => {
+                        // Optimized: Avoid cloning status by using reference
+                        let is_running = matches!(&sb.status, SandboxStatus::Running(_));
+                        let sb_mutex = Arc::new(Mutex::new(sb));
+
+                        // Only running sandbox should be monitored.
+                        if is_running {
+                            let sb_clone = sb_mutex.clone();
+                            monitor(sb_clone);
+                        }
+
+                        sandboxes_clone.write().await.insert(entry_name.clone(), sb_mutex);
+                        info!("Successfully recovered sandbox {}", entry_name);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        // Don't cleanup or remove directory on failure - keep it for debugging
+                        warn!("failed to recover sandbox {}: {:?}, directory kept for analysis", entry_name, e);
+                        Err(anyhow!("Recovery failed for {}", entry_name))
+                    }
+                }
+            });
+            handles.push((entry_name_for_handle, handle));
+        }
+
+        // Wait for all tasks and collect results
+        let mut succeeded = 0;
+        let mut failed = 0;
+
+        for (file_name, handle) in handles {
+            match handle.await {
+                Ok(Ok(_)) => succeeded += 1,
+                Ok(Err(e)) => {
+                    error!("Recovery task failed for {}: {}", file_name, e);
+                    failed += 1;
+                }
+                Err(join_err) => {
+                    error!(
+                        "Recovery task join error for {}: {}",
+                        file_name, join_err
+                    );
+                    failed += 1;
+                }
+            }
+        }
+
+        let duration = start_time.elapsed();
+        info!(
+            "Recovery completed: {}/{} succeeded, {} failed, took {:.2}s",
+            succeeded,
+            total_entries,
+            failed,
+            duration.as_secs_f64()
+        );
     }
 }
 
