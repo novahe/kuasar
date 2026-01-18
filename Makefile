@@ -21,7 +21,7 @@ endif
 
 .PHONY: vmm wasm quark clean all install-vmm install-wasm install-quark install \
         bin/vmm-sandboxer bin/vmm-task bin/vmlinux.bin bin/kuasar.img bin/kuasar.initrd \
-        bin/wasm-sandboxer bin/quark-sandboxer bin/runc-sandboxer \
+        bin/wasm-sandboxer bin/quark-sandboxer bin/runc-sandboxer bin/kuasarctl \
         test-e2e test-e2e-framework verify-e2e local-up clean-e2e help
 
 all: vmm quark wasm
@@ -57,6 +57,10 @@ bin/quark-sandboxer:
 bin/runc-sandboxer:
 	@cd runc && cargo build --release --features=${RUNC_FEATURES}
 	@mkdir -p bin && cp target/release/runc-sandboxer bin/runc-sandboxer
+
+bin/kuasarctl:
+	@cd kuasarctl && cargo build --release
+	@mkdir -p bin && cp target/release/kuasarctl bin/kuasarctl
 
 wasm: bin/wasm-sandboxer
 quark: bin/quark-sandboxer
@@ -109,7 +113,11 @@ install-quark:
 install-runc:
 	@install -p -m 550 bin/runc-sandboxer ${DEST_DIR}${BIN_DIR}/runc-sandboxer
 
-install: all install-vmm install-wasm install-quark install-runc
+install-kuasarctl: bin/kuasarctl
+	@install -d -m 750 ${DEST_DIR}${BIN_DIR}
+	@install -p -m 550 bin/kuasarctl ${DEST_DIR}${BIN_DIR}/kuasarctl
+
+install: all install-vmm install-wasm install-quark install-runc install-kuasarctl
 
 # E2E Testing targets
 test-e2e: ## Run full e2e integration tests (requires environment setup)
