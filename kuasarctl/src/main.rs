@@ -18,16 +18,21 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use log::{debug, error, info, warn};
 use nix::sys::termios::{tcgetattr, tcsetattr, LocalFlags, OutputFlags, SetArg};
+use nix::pty::Winsize;
 use signal_hook::iterator::Signals;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+// TIOCGWINSZ ioctl number for getting terminal window size
+use nix::libc::{TIOCGWINSZ, c_ulong, ioctl as libc_ioctl};
 
 const DEFAULT_DEBUG_PORT: u32 = 1025;
 const KUASAR_SOCKET_PREFIX: &str = "/run/kuasar";
@@ -110,6 +115,47 @@ pub fn resolve_pod_id(socket_dir: &str, pod_prefix: &str) -> Result<String> {
             ))
         }
     }
+}
+
+/// Get the current terminal window size
+fn get_terminal_size(stdin_fd: i32) -> Result<Winsize> {
+    let mut winsize = Winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+
+    // SAFETY: ioctl with TIOCGWINSZ is safe for terminal file descriptors
+    let res = unsafe { libc_ioctl(stdin_fd, TIOCGWINSZ as c_ulong, &mut winsize) };
+
+    if res < 0 {
+        return Err(anyhow::anyhow!("Failed to get terminal size"));
+    }
+
+    if winsize.ws_row == 0 || winsize.ws_col == 0 {
+        // Return default size if ioctl returns zeros
+        winsize.ws_row = 24;
+        winsize.ws_col = 80;
+    }
+
+    Ok(winsize)
+}
+
+/// Send terminal size update through the socket
+fn send_terminal_size(stream: &mut UnixStream, winsize: &Winsize) -> Result<()> {
+    let size_cmd = format!(
+        "\x1b]{};{};{}\x07",
+        winsize.ws_row, winsize.ws_col, 0
+    );
+    stream
+        .write_all(size_cmd.as_bytes())
+        .context("Failed to send terminal size")?;
+    debug!(
+        "Sent terminal size: {} rows x {} columns",
+        winsize.ws_row, winsize.ws_col
+    );
+    Ok(())
 }
 
 /// Kuasar control CLI - Debug and execute commands in Cloud Hypervisor VMs
@@ -325,6 +371,19 @@ fn run_interactive_mode(mut stream: UnixStream) -> Result<()> {
     // Use AsFd trait for safe file descriptor access
     let stdin_fd = stdin.as_fd();
 
+    // Get initial terminal size
+    let initial_size = get_terminal_size(stdin_fd.as_raw_fd())
+        .map_err(|e| anyhow::anyhow!("Failed to get initial terminal size: {}", e))?;
+    info!(
+        "Initial terminal size: {} rows x {} columns",
+        initial_size.ws_row, initial_size.ws_col
+    );
+
+    // Send initial terminal size to remote
+    if let Err(e) = send_terminal_size(&mut stream, &initial_size) {
+        warn!("Failed to send initial terminal size: {}", e);
+    }
+
     // Safely get current terminal settings
     let original_termios = tcgetattr(stdin_fd)
         .map_err(|e| anyhow::anyhow!("Failed to get terminal attributes: {}", e))?;
@@ -349,22 +408,44 @@ fn run_interactive_mode(mut stream: UnixStream) -> Result<()> {
     let stop_flag_outer = Arc::clone(&stop_flag);
     let stop_flag_signal = Arc::clone(&stop_flag);
 
-    // Set up signal handling for Ctrl+C
+    // Set up signal handling for SIGINT and SIGWINCH
     let sigint = 2; // SIGINT
-    let mut signals = Signals::new([sigint])
+    let sigwinch = 28; // SIGWINCH
+    let mut signals = Signals::new([sigint, sigwinch])
         .map_err(|e| anyhow::anyhow!("Failed to create signal handler: {}", e))?;
+
+    // Create a stream clone for size updates
+    let mut size_update_stream = stream.try_clone()
+        .map_err(|e| anyhow::anyhow!("Failed to clone socket for size updates: {}", e))?;
 
     let signal_handle = thread::spawn(move || {
         for sig in &mut signals {
-            if sig == sigint {
-                info!("Ctrl+C received, shutting down gracefully...");
-                *stop_flag_signal.lock().unwrap() = true;
-                break;
+            match sig {
+                s if s == sigint => {
+                    info!("Ctrl+C received, shutting down gracefully...");
+                    *stop_flag_signal.lock().unwrap() = true;
+                    break;
+                }
+                s if s == sigwinch => {
+                    // Handle window resize
+                    let stdin = io::stdin();
+                    let stdin_fd = stdin.as_raw_fd();
+                    if let Ok(new_size) = get_terminal_size(stdin_fd) {
+                        debug!(
+                            "Window resized to: {} rows x {} columns",
+                            new_size.ws_row, new_size.ws_col
+                        );
+                        if let Err(e) = send_terminal_size(&mut size_update_stream, &new_size) {
+                            warn!("Failed to send updated terminal size: {}", e);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     });
 
-    info!("SIGINT handler registered (Ctrl+C to exit)");
+    info!("Signal handlers registered (SIGINT+SIGWINCH)");
 
     // Use scopeguard to ensure terminal settings are restored
     let stdin_fd_guard = stdin_fd.clone();
