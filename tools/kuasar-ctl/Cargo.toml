@@ -1,0 +1,37 @@
+[package]
+name = "kuasar-ctl"
+version = "0.1.0"
+edition = "2021"
+authors = ["The Kuasar Authors"]
+license = "Apache-2.0"
+
+[[bin]]
+name = "kuasar-ctl"
+path = "src/main.rs"
+
+[dependencies]
+# CLI parsing
+clap = { version = "4.4", features = ["derive"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
+env_logger = "0.10"
+log = "0.4"
+
+# Terminal handling
+nix = { version = "0.28", features = ["term"] }
+scopeguard = "1.2"
+
+# vsock and epoll
+epoll = "4.0.1"
+libc = "0.2.138"
+vmm-sys-util = "0.11.0"
+
+# Async runtime (for socket connection)
+tokio = { version = "1.19", features = ["full"] }
+
+[dev-dependencies]
+tempfile = "3.4"

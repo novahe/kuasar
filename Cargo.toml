@@ -3,6 +3,7 @@ members = [
     "vmm/task",
     "vmm/sandbox",
     "vmm/common",
+    "tools/kuasar-ctl",
     "runc",
     "quark",
     "wasm",
