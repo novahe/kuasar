@@ -1,0 +1,16 @@
+#
+# Copyright (c) 2026 The Kuasar Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+apiVersion: v1
+kind: Pod
+metadata:
+  name: busybox-test
+spec:
+  runtimeClassName: runc
+  terminationGracePeriodSeconds: 0
+  containers:
+  - name: busybox
+    image: quay.io/prometheus/busybox:latest
+    command: ["tail", "-f", "/dev/null"]
