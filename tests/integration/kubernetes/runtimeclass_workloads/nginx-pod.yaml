@@ -1,0 +1,19 @@
+#
+# Copyright (c) 2026 The Kuasar Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx-test
+  labels:
+    app: nginx
+spec:
+  runtimeClassName: kuasar-vmm
+  terminationGracePeriodSeconds: 0
+  containers:
+  - name: nginx
+    image: ${NGINX_IMAGE}
+    ports:
+    - containerPort: 80

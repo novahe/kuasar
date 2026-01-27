@@ -22,7 +22,8 @@ endif
 .PHONY: vmm wasm quark clean all install-vmm install-wasm install-quark install \
         bin/vmm-sandboxer bin/vmm-task bin/vmlinux.bin bin/kuasar.img bin/kuasar.initrd \
         bin/wasm-sandboxer bin/quark-sandboxer bin/runc-sandboxer \
-        test-e2e test-e2e-framework verify-e2e local-up clean-e2e help
+        test-e2e test-e2e-framework verify-e2e local-up clean-e2e \
+        test-k8s setup-k8s help
 
 all: vmm quark wasm
 
@@ -138,6 +139,48 @@ local-up: ## Start local Kuasar cluster for testing
 
 clean-e2e: ## Clean e2e test artifacts
 	@$(MAKE) -f Makefile.e2e clean-e2e
+
+# Kubernetes E2E Testing targets
+K8S_RUNTIME_CLASS ?= kuasar-vmm
+K8S_RUNTIME_TYPE ?= vmm
+K8S_TEST_DEBUG ?= false
+K8S_TEST_FAIL_FAST ?= no
+K8S_TEST_PARALLEL_JOBS ?= 4
+K8S_TEST_UNION ?=
+
+setup-k8s: ## Setup Kubernetes e2e test environment
+	@echo "Setting up Kuasar Kubernetes e2e test environment..."
+	@cd tests/integration/kubernetes && KUASAR_RUNTIME_CLASS=$(K8S_RUNTIME_CLASS) KUASAR_RUNTIME_TYPE=$(K8S_RUNTIME_TYPE) ./setup.sh
+
+test-k8s: ## Run Kubernetes e2e tests (requires k8s cluster access)
+	@echo "Running Kuasar Kubernetes e2e tests..."
+	@cd tests/integration/kubernetes && \
+		KUASAR_RUNTIME_CLASS=$(K8S_RUNTIME_CLASS) \
+		KUASAR_RUNTIME_TYPE=$(K8S_RUNTIME_TYPE) \
+		K8S_TEST_DEBUG=$(K8S_TEST_DEBUG) \
+		K8S_TEST_FAIL_FAST=$(K8S_TEST_FAIL_FAST) \
+		K8S_TEST_PARALLEL_JOBS=$(K8S_TEST_PARALLEL_JOBS) \
+		K8S_TEST_UNION="$(K8S_TEST_UNION)" \
+		./run_k8s_tests.sh
+
+test-k8s-single: ## Run a single Kubernetes e2e test (usage: make test-k8s-single TEST=file.bats)
+	@cd tests/integration/kubernetes && \
+		KUASAR_RUNTIME_CLASS=$(K8S_RUNTIME_CLASS) \
+		KUASAR_RUNTIME_TYPE=$(K8S_RUNTIME_TYPE) \
+		bats $(TEST)
+
+verify-k8s: ## Verify k8s test environment (kubectl, tools)
+	@command -v kubectl >/dev/null 2>&1 || { echo "kubectl not found"; exit 1; }
+	@command -v yq >/dev/null 2>&1 || { echo "yq not found"; exit 1; }
+	@command -v bats >/dev/null 2>&1 || { echo "bats not found"; exit 1; }
+	@kubectl cluster-info >/dev/null 2>&1 || { echo "Cannot access k8s cluster"; exit 1; }
+	@echo "Kubernetes test environment verified successfully"
+
+clean-k8s: ## Clean k8s test resources
+	@echo "Cleaning Kubernetes test resources..."
+	@kubectl delete pods --all --all-namespaces --ignore-not-found=true 2>/dev/null || true
+	@kubectl delete deployments --all --all-namespaces --ignore-not-found=true 2>/dev/null || true
+	@rm -rf tests/integration/kubernetes/runtimeclass_workloads_work 2>/dev/null || true
 
 .PHONY: help
 help: ## Display this help screen

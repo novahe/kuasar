@@ -1,0 +1,16 @@
+#
+# Copyright (c) 2026 The Kuasar Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${POD_NAME}
+spec:
+  runtimeClassName: ${RUNTIMECLASS}
+  terminationGracePeriodSeconds: 0
+  containers:
+  - name: test-container
+    image: ${IMAGE:-${BUSYBOX_IMAGE}}
+    command: ["tail", "-f", "/dev/null"]
