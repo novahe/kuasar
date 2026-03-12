@@ -57,7 +57,7 @@ use tracing::instrument;
 use vmm_common::{
     mount::get_mount_type,
     storage::{Storage, ANNOTATION_KEY_STORAGE},
-    KUASAR_STATE_DIR,
+    trace, KUASAR_STATE_DIR,
 };
 
 use crate::{
@@ -117,20 +117,57 @@ impl ContainerFactory<KuasarContainer> for KuasarFactory {
         ns: &str,
         req: &CreateTaskRequest,
     ) -> containerd_shim::Result<KuasarContainer> {
+        let total_start = std::time::Instant::now();
         rescan_pci_bus().await?;
         let bundle = format!("{}/{}", KUASAR_STATE_DIR, req.id);
+        let read_spec_start = std::time::Instant::now();
         let spec: Spec = read_spec(&bundle).await?;
+        trace::record_phase(
+            req.id(),
+            req.id(),
+            Some(req.id()),
+            None,
+            "task.create.read_spec",
+            read_spec_start.elapsed(),
+            true,
+            None,
+            Some("cloud_hypervisor"),
+        );
         let annotations = spec.annotations().clone().unwrap_or_default();
+        let read_storages_start = std::time::Instant::now();
         let storages = if let Some(storage_str) = annotations.get(ANNOTATION_KEY_STORAGE) {
             serde_json::from_str::<Vec<Storage>>(storage_str)?
         } else {
             read_storages(&bundle, req.id()).await?
         };
+        trace::record_phase(
+            req.id(),
+            req.id(),
+            Some(req.id()),
+            None,
+            "task.create.read_storages",
+            read_storages_start.elapsed(),
+            true,
+            None,
+            Some("cloud_hypervisor"),
+        );
+        let add_storages_start = std::time::Instant::now();
         self.sandbox
             .lock()
             .await
             .add_storages(req.id(), storages)
             .await?;
+        trace::record_phase(
+            req.id(),
+            req.id(),
+            Some(req.id()),
+            None,
+            "task.create.add_storages",
+            add_storages_start.elapsed(),
+            true,
+            None,
+            Some("cloud_hypervisor"),
+        );
         let mut opts = Options::new();
         if let Some(any) = req.options.as_ref() {
             let mut input = CodedInputStream::from_bytes(any.value.as_ref());
@@ -143,6 +180,7 @@ impl ContainerFactory<KuasarContainer> for KuasarFactory {
 
         // As the rootfs is already mounted when handling the storage, the root in spec is one of the
         // storage mount point. so no need to mount rootfs anymore
+        let create_runtime_start = std::time::Instant::now();
         let runc = create_runc(
             runtime,
             ns,
@@ -150,17 +188,52 @@ impl ContainerFactory<KuasarContainer> for KuasarFactory {
             &opts,
             Some(Arc::new(ShimExecutor::default())),
         )?;
+        trace::record_phase(
+            req.id(),
+            req.id(),
+            Some(req.id()),
+            None,
+            "task.create.create_runtime",
+            create_runtime_start.elapsed(),
+            true,
+            Some(runtime),
+            Some("cloud_hypervisor"),
+        );
 
         let id = req.id();
 
+        let read_io_start = std::time::Instant::now();
         let stdio = match read_io(&bundle, req.id(), None).await {
             Ok(io) => Stdio::new(&io.stdin, &io.stdout, &io.stderr, io.terminal),
             Err(_) => Stdio::new(req.stdin(), req.stdout(), req.stderr(), req.terminal()),
         };
+        trace::record_phase(
+            req.id(),
+            req.id(),
+            Some(req.id()),
+            None,
+            "task.create.read_io",
+            read_io_start.elapsed(),
+            true,
+            Some(runtime),
+            Some("cloud_hypervisor"),
+        );
 
         // for qemu, the io path is pci address for virtio-serial
         // that needs to be converted to the serial file path
+        let convert_stdio_start = std::time::Instant::now();
         let stdio = convert_stdio(&stdio).await?;
+        trace::record_phase(
+            req.id(),
+            req.id(),
+            Some(req.id()),
+            None,
+            "task.create.convert_stdio",
+            convert_stdio_start.elapsed(),
+            true,
+            Some(runtime),
+            Some("cloud_hypervisor"),
+        );
 
         let mut init = InitProcess::new(
             id,
@@ -168,7 +241,30 @@ impl ContainerFactory<KuasarContainer> for KuasarFactory {
             KuasarInitLifecycle::new(runc.clone(), opts.clone(), &bundle),
         );
 
+        let do_create_start = std::time::Instant::now();
         self.do_create(&mut init).await?;
+        trace::record_phase(
+            req.id(),
+            req.id(),
+            Some(req.id()),
+            None,
+            "task.create.do_create",
+            do_create_start.elapsed(),
+            true,
+            Some(runtime),
+            Some("cloud_hypervisor"),
+        );
+        trace::record_phase(
+            req.id(),
+            req.id(),
+            Some(req.id()),
+            None,
+            "task.create.total",
+            total_start.elapsed(),
+            true,
+            Some(runtime),
+            Some("cloud_hypervisor"),
+        );
         let container = KuasarContainer {
             id: id.to_string(),
             bundle: bundle.to_string(),
@@ -199,6 +295,7 @@ impl KuasarFactory {
     #[instrument(skip_all)]
     async fn do_create(&self, init: &mut InitProcess) -> Result<()> {
         let id = init.id.to_string();
+        let trace_key = id.clone();
         let stdio = &init.stdio;
         let opts = &init.lifecycle.opts;
         let bundle = &init.lifecycle.bundle;
@@ -228,6 +325,7 @@ impl KuasarFactory {
             (None, Some(pio))
         };
 
+        let runtime_create = std::time::Instant::now();
         let resp = init
             .lifecycle
             .runtime
@@ -239,7 +337,30 @@ impl KuasarFactory {
             }
             return Err(runtime_error(bundle, e, "OCI runtime create failed").await);
         }
+        trace::record_phase(
+            &trace_key,
+            &trace_key,
+            Some(&id),
+            None,
+            "task.create.runtime_create",
+            runtime_create.elapsed(),
+            true,
+            None,
+            Some("cloud_hypervisor"),
+        );
+        let copy_io = std::time::Instant::now();
         copy_io_or_console(init, socket, pio, init.lifecycle.exit_signal.clone()).await?;
+        trace::record_phase(
+            &trace_key,
+            &trace_key,
+            Some(&id),
+            None,
+            "task.create.copy_io",
+            copy_io.elapsed(),
+            true,
+            None,
+            Some("cloud_hypervisor"),
+        );
         let pid = read_file_to_str(pid_path).await?.parse::<i32>()?;
         init.pid = pid;
         Ok(())
@@ -350,10 +471,22 @@ impl ProcessFactory<ExecProcess> for KuasarExecFactory {
 impl ProcessLifecycle<InitProcess> for KuasarInitLifecycle {
     #[instrument(skip_all)]
     async fn start(&self, p: &mut InitProcess) -> containerd_shim::Result<()> {
+        let start_time = std::time::Instant::now();
         if let Err(e) = self.runtime.start(p.id.as_str()).await {
             return Err(runtime_error(&p.lifecycle.bundle, e, "OCI runtime start failed").await);
         }
         p.state = Status::RUNNING;
+        trace::record_phase(
+            &p.id,
+            &p.id,
+            Some(&p.id),
+            None,
+            "task.start.init",
+            start_time.elapsed(),
+            true,
+            None,
+            Some("cloud_hypervisor"),
+        );
         Ok(())
     }
 

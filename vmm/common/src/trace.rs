@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 use anyhow::anyhow;
 use lazy_static::lazy_static;
@@ -76,6 +79,31 @@ pub fn init_otlp_tracer(otlp_service_name: &str) -> anyhow::Result<Tracer> {
         ])))
         .install_batch(opentelemetry::runtime::Tokio)?;
     Ok(tracer)
+}
+
+pub fn record_phase(
+    trace_key: &str,
+    sandbox_id: &str,
+    container_id: Option<&str>,
+    exec_id: Option<&str>,
+    phase: &str,
+    duration: Duration,
+    success: bool,
+    runtime: Option<&str>,
+    hypervisor: Option<&str>,
+) {
+    tracing::info!(
+        trace_key,
+        sandbox_id,
+        container_id = container_id.unwrap_or(""),
+        exec_id = exec_id.unwrap_or(""),
+        phase,
+        duration_ms = duration.as_millis() as u64,
+        success,
+        runtime = runtime.unwrap_or(""),
+        hypervisor = hypervisor.unwrap_or(""),
+        "phase finished"
+    );
 }
 
 // TODO: may hang indefinitely, use it again when https://github.com/open-telemetry/opentelemetry-rust/issues/868 is resolved

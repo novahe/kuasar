@@ -14,14 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    collections::HashMap,
-    env,
-    io::ErrorKind,
-    path::Path,
-    sync::Arc,
-    time::Instant,
-};
+use std::{collections::HashMap, env, io::ErrorKind, path::Path, sync::Arc, time::Instant};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -47,7 +40,8 @@ use ttrpc::context::with_timeout;
 use vmm_common::{
     api::{empty::Empty, sandbox::SetupSandboxRequest, sandbox_ttrpc::SandboxServiceClient},
     storage::Storage,
-    ETC_HOSTS, ETC_RESOLV, HOSTNAME_FILENAME, HOSTS_FILENAME, RESOLV_FILENAME, SHARED_DIR_SUFFIX,
+    trace, ETC_HOSTS, ETC_RESOLV, HOSTNAME_FILENAME, HOSTS_FILENAME, RESOLV_FILENAME,
+    SHARED_DIR_SUFFIX,
 };
 
 use crate::{
@@ -118,7 +112,10 @@ where
                 Ok(Some(entry)) => entries.push(entry),
                 Ok(None) => break,
                 Err(e) => {
-                    warn!("Failed to read directory entry: {}, stopping recovery scan", e);
+                    warn!(
+                        "Failed to read directory entry: {}, stopping recovery scan",
+                        e
+                    );
                     break;
                 }
             }
@@ -141,7 +138,10 @@ where
         for (index, entry) in entries.into_iter().enumerate() {
             // Log progress every 10 entries
             if index > 0 && index % 10 == 0 {
-                debug!("Recovery progress: {}/{} entries processed", index, total_entries);
+                debug!(
+                    "Recovery progress: {}/{} entries processed",
+                    index, total_entries
+                );
             }
 
             let file_type = match entry.file_type().await {
@@ -172,7 +172,10 @@ where
             let permit = match semaphore.clone().acquire_owned().await {
                 Ok(p) => p,
                 Err(e) => {
-                    warn!("Failed to acquire semaphore permit for {}: {}, skipping", file_name, e);
+                    warn!(
+                        "Failed to acquire semaphore permit for {}: {}, skipping",
+                        file_name, e
+                    );
                     continue;
                 }
             };
@@ -201,13 +204,19 @@ where
                             monitor(sb_clone);
                         }
 
-                        sandboxes_clone.write().await.insert(entry_name.clone(), sb_mutex);
+                        sandboxes_clone
+                            .write()
+                            .await
+                            .insert(entry_name.clone(), sb_mutex);
                         info!("Successfully recovered sandbox {}", entry_name);
                         Ok(())
                     }
                     Err(e) => {
                         // Don't cleanup or remove directory on failure - keep it for debugging
-                        warn!("failed to recover sandbox {}: {:?}, directory kept for analysis", entry_name, e);
+                        warn!(
+                            "failed to recover sandbox {}: {:?}, directory kept for analysis",
+                            entry_name, e
+                        );
                         Err(anyhow!("Recovery failed for {}", entry_name))
                     }
                 }
@@ -227,10 +236,7 @@ where
                     failed += 1;
                 }
                 Err(join_err) => {
-                    error!(
-                        "Recovery task join error for {}: {}",
-                        file_name, join_err
-                    );
+                    error!("Recovery task join error for {}: {}", file_name, join_err);
                     failed += 1;
                 }
             }
@@ -277,6 +283,7 @@ where
 
     #[instrument(skip_all)]
     async fn create(&self, id: &str, s: SandboxOption) -> Result<()> {
+        let total_start = Instant::now();
         if self.sandboxes.read().await.get(id).is_some() {
             return Err(Error::AlreadyExist("sandbox".to_string()));
         }
@@ -299,7 +306,19 @@ where
                 return Err(e);
             }
         }
+        let create_vm_start = Instant::now();
         let vm = self.factory.create_vm(id, &s).await?;
+        trace::record_phase(
+            id,
+            id,
+            None,
+            None,
+            "sandbox.create.factory_create_vm",
+            create_vm_start.elapsed(),
+            true,
+            None,
+            Some("cloud_hypervisor"),
+        );
         let mut sandbox = KuasarSandbox {
             vm,
             id: id.to_string(),
@@ -316,35 +335,108 @@ where
         };
 
         // setup sandbox files: hosts, hostname and resolv.conf for guest
+        let setup_files_start = Instant::now();
         sandbox.setup_sandbox_files().await?;
+        trace::record_phase(
+            id,
+            id,
+            None,
+            None,
+            "sandbox.create.setup_files",
+            setup_files_start.elapsed(),
+            true,
+            None,
+            Some("cloud_hypervisor"),
+        );
+        let post_create_start = Instant::now();
         self.hooks.post_create(&mut sandbox).await?;
+        trace::record_phase(
+            id,
+            id,
+            None,
+            None,
+            "sandbox.create.post_create_hook",
+            post_create_start.elapsed(),
+            true,
+            None,
+            Some("cloud_hypervisor"),
+        );
         sandbox.dump().await?;
         self.sandboxes
             .write()
             .await
             .insert(id.to_string(), Arc::new(Mutex::new(sandbox)));
+        trace::record_phase(
+            id,
+            id,
+            None,
+            None,
+            "sandbox.create.total",
+            total_start.elapsed(),
+            true,
+            None,
+            Some("cloud_hypervisor"),
+        );
         Ok(())
     }
 
     #[instrument(skip_all)]
     async fn start(&self, id: &str) -> Result<()> {
+        let total_start = Instant::now();
         let sandbox_mutex = self.sandbox(id).await?;
         let mut sandbox = sandbox_mutex.lock().await;
+        let pre_start = Instant::now();
         self.hooks.pre_start(&mut sandbox).await?;
+        trace::record_phase(
+            id,
+            id,
+            None,
+            None,
+            "sandbox.start.pre_start_hook",
+            pre_start.elapsed(),
+            true,
+            None,
+            Some("cloud_hypervisor"),
+        );
 
         // Prepare pod network if it has a private network namespace
         if !sandbox.data.netns.is_empty() {
+            let network_prepare = Instant::now();
             sandbox.prepare_network().await?;
+            trace::record_phase(
+                id,
+                id,
+                None,
+                None,
+                "sandbox.start.network_prepare",
+                network_prepare.elapsed(),
+                true,
+                None,
+                Some("cloud_hypervisor"),
+            );
         }
 
+        let sandbox_start = Instant::now();
         if let Err(e) = sandbox.start().await {
             sandbox.destroy_network().await;
             return Err(e);
         }
+        trace::record_phase(
+            id,
+            id,
+            None,
+            None,
+            "sandbox.start.hypervisor_start",
+            sandbox_start.elapsed(),
+            true,
+            None,
+            Some("cloud_hypervisor"),
+        );
 
         let sandbox_clone = sandbox_mutex.clone();
         monitor(sandbox_clone);
 
+        let add_to_cgroup = Instant::now();
         if let Err(e) = sandbox.add_to_cgroup().await {
             if let Err(re) = sandbox.stop(true).await {
                 warn!("roll back in add to cgroup {}", re);
@@ -353,7 +445,19 @@ where
             sandbox.destroy_network().await;
             return Err(e);
         }
+        trace::record_phase(
+            id,
+            id,
+            None,
+            None,
+            "sandbox.start.add_to_cgroup",
+            add_to_cgroup.elapsed(),
+            true,
+            None,
+            Some("cloud_hypervisor"),
+        );
 
+        let post_start = Instant::now();
         if let Err(e) = self.hooks.post_start(&mut sandbox).await {
             if let Err(re) = sandbox.stop(true).await {
                 warn!("roll back in sandbox post start {}", re);
@@ -362,6 +466,17 @@ where
             sandbox.destroy_network().await;
             return Err(e);
         }
+        trace::record_phase(
+            id,
+            id,
+            None,
+            None,
+            "sandbox.start.post_start_hook",
+            post_start.elapsed(),
+            true,
+            None,
+            Some("cloud_hypervisor"),
+        );
 
         if let Err(e) = sandbox.dump().await {
             if let Err(re) = sandbox.stop(true).await {
@@ -372,6 +487,17 @@ where
             return Err(e);
         }
 
+        trace::record_phase(
+            id,
+            id,
+            None,
+            None,
+            "sandbox.start.total",
+            total_start.elapsed(),
+            true,
+            None,
+            Some("cloud_hypervisor"),
+        );
         Ok(())
     }
 
@@ -585,8 +711,21 @@ where
 {
     #[instrument(skip_all)]
     async fn start(&mut self) -> Result<()> {
+        let vm_start = Instant::now();
         let pid = self.vm.start().await?;
+        trace::record_phase(
+            &self.id,
+            &self.id,
+            None,
+            None,
+            "sandbox.start.vm_start",
+            vm_start.elapsed(),
+            true,
+            None,
+            Some("cloud_hypervisor"),
+        );
 
+        let init_client = Instant::now();
         if let Err(e) = self.init_client().await {
             if let Err(re) = self.vm.stop(true).await {
                 warn!("roll back in init task client: {}", re);
@@ -594,7 +733,19 @@ where
             }
             return Err(e);
         }
+        trace::record_phase(
+            &self.id,
+            &self.id,
+            None,
+            None,
+            "sandbox.start.init_client",
+            init_client.elapsed(),
+            true,
+            None,
+            Some("cloud_hypervisor"),
+        );
 
+        let setup_sandbox = Instant::now();
         if let Err(e) = self.setup_sandbox().await {
             if let Err(re) = self.vm.stop(true).await {
                 error!("roll back in setup sandbox client: {}", re);
@@ -602,8 +753,31 @@ where
             }
             return Err(e);
         }
+        trace::record_phase(
+            &self.id,
+            &self.id,
+            None,
+            None,
+            "sandbox.start.setup_sandbox",
+            setup_sandbox.elapsed(),
+            true,
+            None,
+            Some("cloud_hypervisor"),
+        );
 
+        let forward_events = Instant::now();
         self.forward_events().await;
+        trace::record_phase(
+            &self.id,
+            &self.id,
+            None,
+            None,
+            "sandbox.start.forward_events",
+            forward_events.elapsed(),
+            true,
+            None,
+            Some("cloud_hypervisor"),
+        );
 
         self.status = SandboxStatus::Running(pid);
         Ok(())
