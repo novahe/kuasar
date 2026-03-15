@@ -39,6 +39,7 @@ use nix::{
 use signal_hook_tokio::Signals;
 use streaming::STREAMING_SERVICE;
 use tokio::sync::mpsc::channel;
+use tracing::instrument;
 use tracing_subscriber::{
     self, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer, Registry,
 };
@@ -148,6 +149,7 @@ lazy_static! {
     ]);
 }
 
+#[instrument(skip_all)]
 async fn initialize() -> anyhow::Result<TaskConfig> {
     early_init_call().await?;
 
@@ -201,6 +203,7 @@ fn init_logger(log_level: &str) -> anyhow::Result<()> {
 }
 
 #[tokio::main]
+#[instrument]
 async fn main() {
     let config = match initialize().await {
         Ok(c) => c,
@@ -423,6 +426,7 @@ async fn mount_static_mounts(mounts: Vec<StaticMount>) -> Result<()> {
 
 // create_ttrpc_server will create all the ttrpc service and register them to a server that
 // bind to vsock 1024 port.
+#[instrument(skip_all)]
 async fn create_ttrpc_server() -> anyhow::Result<Server> {
     let (tx, rx) = channel(128);
     let task = create_task_service(tx).await?;

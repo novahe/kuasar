@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::{
+    collections::HashMap,
     os::fd::{IntoRawFd, RawFd},
     sync::Arc,
     time::Duration,
@@ -44,12 +45,15 @@ use tokio::{
     time::timeout,
 };
 use ttrpc::{
-    context::with_timeout,
+    context::Context,
     r#async::{Client, TtrpcContext},
 };
-use vmm_common::api::{
-    sandbox::{CheckRequest, SetupSandboxRequest, SyncClockPacket},
-    sandbox_ttrpc::SandboxServiceClient,
+use vmm_common::{
+    api::{
+        sandbox::{CheckRequest, SetupSandboxRequest, SyncClockPacket},
+        sandbox_ttrpc::SandboxServiceClient,
+    },
+    trace::inject_trace_context,
 };
 
 const HVSOCK_RETRY_TIMEOUT_IN_MS: u64 = 10;
@@ -233,7 +237,13 @@ async fn do_check_agent(client: &SandboxServiceClient, timeout: u64) {
     let req = CheckRequest::new();
     let duration = Duration::from_secs(timeout).as_nanos() as i64;
     loop {
-        if client.check(with_timeout(duration), &req).await.is_ok() {
+        let mut metadata = HashMap::new();
+        inject_trace_context(&mut metadata);
+        let ctx = Context {
+            metadata,
+            timeout_nano: duration,
+        };
+        if client.check(ctx, &req).await.is_ok() {
             return;
         };
     }
@@ -243,11 +253,14 @@ pub(crate) async fn client_setup_sandbox(
     client: &SandboxServiceClient,
     config: &SetupSandboxRequest,
 ) -> Result<()> {
+    let mut metadata = HashMap::new();
+    inject_trace_context(&mut metadata);
+    let ctx = Context {
+        metadata,
+        timeout_nano: Duration::from_secs(10).as_nanos() as i64,
+    };
     client
-        .setup_sandbox(
-            with_timeout(Duration::from_secs(10).as_nanos() as i64),
-            config,
-        )
+        .setup_sandbox(ctx, config)
         .await
         .map_err(|e| anyhow!("failed to setup sandbox: {}", e))?;
     Ok(())
@@ -290,8 +303,14 @@ async fn do_once_sync_clock(
         .map_err(|e| anyhow!("get current clock: {}", e))?
         .num_nanoseconds();
 
+    let mut metadata = HashMap::new();
+    inject_trace_context(&mut metadata);
+    let ctx = Context {
+        metadata: metadata.clone(),
+        timeout_nano: Duration::from_secs(1).as_nanos() as i64,
+    };
     let mut p = client
-        .sync_clock(with_timeout(Duration::from_secs(1).as_nanos() as i64), &req)
+        .sync_clock(ctx, &req)
         .await
         .map_err(|e| anyhow!("get guest clock packet: {:?}", e))?;
 
@@ -306,8 +325,13 @@ async fn do_once_sync_clock(
         p.ServerArriveTime,
     )?;
     if p.Delta.abs() > tolerance_nanos.as_nanos() as i64 {
+        inject_trace_context(&mut metadata);
+        let ctx = Context {
+            metadata,
+            timeout_nano: Duration::from_secs(1).as_nanos() as i64,
+        };
         client
-            .sync_clock(with_timeout(Duration::from_secs(1).as_nanos() as i64), &p)
+            .sync_clock(ctx, &p)
             .await
             .map_err(|e| anyhow!("set delta: {:?}", e))?;
     }

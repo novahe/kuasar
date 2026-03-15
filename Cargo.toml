@@ -6,7 +6,6 @@ members = [
     "runc",
     "quark",
     "wasm",
-    "shim",
 ]
 exclude = [
     "tests/e2e"

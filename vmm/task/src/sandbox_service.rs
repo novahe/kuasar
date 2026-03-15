@@ -39,6 +39,7 @@ use tokio::{
     io::AsyncWriteExt,
     sync::{mpsc::Receiver, Mutex},
 };
+use tracing::instrument;
 use vmm_common::{
     api,
     api::{
@@ -49,9 +50,18 @@ use vmm_common::{
             SyncClockPacket, UpdateInterfacesRequest, UpdateRoutesRequest,
         },
     },
+    trace::extract_trace_context,
 };
 
 use crate::{netlink::Handle, sandbox::setup_sandbox, NAMESPACE};
+
+macro_rules! attach_trace_context {
+    ($ctx:expr) => {
+        if let Some(parent) = extract_trace_context(Some(&$ctx.metadata)) {
+            tracing_opentelemetry::OpenTelemetrySpanExt::set_parent(&tracing::Span::current(), parent);
+        }
+    };
+}
 
 pub struct SandboxService {
     pub namespace: String,
@@ -77,11 +87,14 @@ impl SandboxService {
 
 #[async_trait]
 impl api::sandbox_ttrpc::SandboxService for SandboxService {
+    #[instrument(skip_all, fields(count = req.interfaces.len()))]
     async fn update_interfaces(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: UpdateInterfacesRequest,
     ) -> TtrpcResult<Empty> {
+        attach_trace_context!(ctx);
+
         self.handle
             .lock()
             .await
@@ -90,20 +103,26 @@ impl api::sandbox_ttrpc::SandboxService for SandboxService {
         Ok(Empty::new())
     }
 
+    #[instrument(skip_all, fields(count = req.routes.len()))]
     async fn update_routes(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: UpdateRoutesRequest,
     ) -> TtrpcResult<Empty> {
+        attach_trace_context!(ctx);
+
         self.handle.lock().await.update_routes(req.routes).await?;
         Ok(Empty::new())
     }
 
+    #[instrument(skip_all, fields(interfaces_count = req.interfaces.len(), routes_count = req.routes.len()))]
     async fn setup_sandbox(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: SetupSandboxRequest,
     ) -> TtrpcResult<Empty> {
+        attach_trace_context!(ctx);
+
         match req.config.type_url.as_str() {
             "PodSandboxConfig" => {
                 let config =
@@ -137,15 +156,20 @@ impl api::sandbox_ttrpc::SandboxService for SandboxService {
         Ok(Empty::new())
     }
 
-    async fn check(&self, _ctx: &TtrpcContext, _req: CheckRequest) -> TtrpcResult<Empty> {
+    #[instrument(skip_all)]
+    async fn check(&self, ctx: &TtrpcContext, _req: CheckRequest) -> TtrpcResult<Empty> {
+        attach_trace_context!(ctx);
         Ok(Empty::new())
     }
 
+    #[instrument(skip_all, fields(command = %req.command))]
     async fn exec_vm_process(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: ExecVMProcessRequest,
     ) -> TtrpcResult<ExecVMProcessResponse> {
+        attach_trace_context!(ctx);
+
         let out = do_execute_cmd(&req.command, req.stdin.as_slice()).await?;
 
         let mut resp = ExecVMProcessResponse::new();
@@ -153,11 +177,14 @@ impl api::sandbox_ttrpc::SandboxService for SandboxService {
         Ok(resp)
     }
 
+    #[instrument(skip_all, fields(delta = req.Delta))]
     async fn sync_clock(
         &self,
-        _ctx: &TtrpcContext,
+        ctx: &TtrpcContext,
         req: SyncClockPacket,
     ) -> TtrpcResult<SyncClockPacket> {
+        attach_trace_context!(ctx);
+
         let mut resp = req.clone();
         let clock_id = ClockId::from_raw(nix::libc::CLOCK_REALTIME);
         match req.Delta {
@@ -182,6 +209,7 @@ impl api::sandbox_ttrpc::SandboxService for SandboxService {
 
     async fn get_events(&self, _ctx: &TtrpcContext, _: Empty) -> TtrpcResult<Envelope> {
         while let Some((topic, event)) = self.rx.lock().await.recv().await {
+            let _span = tracing::info_span!("received_event", topic = %topic).entered();
             debug!("received event {:?}", event);
             // Only OOM Event is supported.
             // TODO: Support all topic

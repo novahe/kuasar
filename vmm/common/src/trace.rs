@@ -14,17 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{collections::HashMap, sync::atomic::{AtomicBool, Ordering}};
 
 use anyhow::anyhow;
 use lazy_static::lazy_static;
 use opentelemetry::{
     global,
+    propagation::{Extractor, Injector, TextMapPropagator},
     sdk::{
+        propagation::TraceContextPropagator,
         trace::{self, Tracer},
         Resource,
     },
 };
+use tracing::Span;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::{
     layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer, Registry,
 };
@@ -82,4 +86,66 @@ pub fn init_otlp_tracer(otlp_service_name: &str) -> anyhow::Result<Tracer> {
 #[allow(dead_code)]
 pub fn shutdown_tracing() {
     global::shutdown_tracer_provider();
+}
+
+/// TtrpcMetadataCarrier implements OpenTelemetry Injector/Extractor traits
+/// for ttrpc metadata to enable W3C Trace Context propagation across ttrpc boundaries.
+pub struct TtrpcMetadataCarrier<'a> {
+    metadata: &'a mut HashMap<String, Vec<String>>,
+}
+
+impl<'a> TtrpcMetadataCarrier<'a> {
+    pub fn new(metadata: &'a mut HashMap<String, Vec<String>>) -> Self {
+        Self { metadata }
+    }
+}
+
+impl<'a> Injector for TtrpcMetadataCarrier<'a> {
+    fn set(&mut self, key: &str, value: String) {
+        self.metadata.insert(key.to_string(), vec![value]);
+    }
+}
+
+impl<'a> Extractor for TtrpcMetadataCarrier<'a> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.metadata
+            .get(key)
+            .and_then(|v| v.first())
+            .map(|s| s.as_str())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.metadata.keys().map(|k| k.as_str()).collect()
+    }
+}
+
+/// Inject current trace context into ttrpc metadata.
+/// Returns early if tracing is disabled (zero overhead).
+pub fn inject_trace_context(metadata: &mut HashMap<String, Vec<String>>) {
+    if !is_enabled() {
+        return;
+    }
+
+    let propagator = TraceContextPropagator::new();
+    let context = Span::current().context();
+    let mut carrier = TtrpcMetadataCarrier::new(metadata);
+    propagator.inject_context(&context, &mut carrier);
+}
+
+/// Extract trace context from ttrpc metadata and set as parent of current span.
+/// Returns None if no trace context found (graceful degradation).
+pub fn extract_trace_context(
+    metadata: Option<&HashMap<String, Vec<String>>>,
+) -> Option<opentelemetry::Context> {
+    if !is_enabled() {
+        return None;
+    }
+
+    let metadata = metadata?;
+    let propagator = TraceContextPropagator::new();
+    let mut carrier_map = metadata.clone();
+    let carrier = TtrpcMetadataCarrier::new(&mut carrier_map);
+    let context = propagator.extract(&carrier);
+
+    Some(context)
 }

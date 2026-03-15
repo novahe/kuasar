@@ -156,7 +156,7 @@ where
 {
     type Sandbox = KuasarSandbox<F::VM>;
 
-    #[instrument(skip_all)]
+    #[instrument(skip_all, fields(sandbox_id = %id))]
     async fn create(&self, id: &str, s: SandboxOption) -> Result<()> {
         if self.sandboxes.read().await.get(id).is_some() {
             return Err(Error::AlreadyExist("sandbox".to_string()));

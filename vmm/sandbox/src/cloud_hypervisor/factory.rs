@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use containerd_sandbox::SandboxOption;
+use tracing::instrument;
 
 use crate::{
     cloud_hypervisor::{
@@ -39,6 +40,7 @@ impl VMFactory for CloudHypervisorVMFactory {
         Self { vm_config: config }
     }
 
+    #[instrument(skip_all, fields(vm_id = %id))]
     async fn create_vm(
         &self,
         id: &str,
