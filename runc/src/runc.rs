@@ -222,6 +222,10 @@ impl RuncFactory {
             if let Some(s) = socket {
                 s.clean().await;
             }
+            if let Some(pio) = pio {
+                pio.clean();
+                drop(pio);
+            }
             let runtime_e = runtime_error(e, bundle).await;
             return Err(runtime_e);
         }
@@ -445,7 +449,6 @@ impl ProcessLifecycle<ExecProcess> for RuncExecLifecycle {
             exec_opts.io = pio.io.as_ref().cloned();
             (None, Some(pio))
         };
-        //TODO  checkpoint support
         let exec_result = self
             .runtime
             .exec(&self.container_id, &self.spec, Some(&exec_opts))
@@ -453,6 +456,10 @@ impl ProcessLifecycle<ExecProcess> for RuncExecLifecycle {
         if let Err(e) = exec_result {
             if let Some(s) = socket {
                 s.clean().await;
+            }
+            if let Some(pio) = pio {
+                pio.clean();
+                drop(pio);
             }
             return Err(other!("failed to start runc exec: {}", e));
         }

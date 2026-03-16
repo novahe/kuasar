@@ -55,6 +55,29 @@ pub struct ProcessIO {
     pub copy: bool,
 }
 
+impl ProcessIO {
+    pub fn clean(&self) {
+        if let Some(io) = &self.io {
+            io.close_after_start();
+            // The underlying PipedIo only holds RawFd (i32) which does not implement Drop.
+            // When executing `io.stdin()`, `io.stdout()`, and `io.stderr()`, the RawFds
+            // are wrapped into `tokio_pipe::PipeWrite/PipeRead` objects.
+            // These tokio objects implement Drop, which means Rust will automatically
+            // call `close(fd)` when they go out of scope at the end of this block.
+            // If we don't call this on error paths, the RawFds will leak in the system.
+            if let Some(stdin) = io.stdin() {
+                let _ = stdin;
+            }
+            if let Some(stdout) = io.stdout() {
+                let _ = stdout;
+            }
+            if let Some(stderr) = io.stderr() {
+                let _ = stderr;
+            }
+        }
+    }
+}
+
 pub fn create_io(
     id: &str,
     _io_uid: u32,
@@ -236,3 +259,5 @@ pub fn prepare_unix_socket(unix_socket: &str) -> Result<(), anyhow::Error> {
     }
     Ok(())
 }
+
+

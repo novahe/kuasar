@@ -87,6 +87,11 @@ pub struct PreemptableReceiver {
     preempt: Receiver<()>,
 }
 
+#[derive(Debug, PartialEq)]
+enum StdoutStreamEvent {
+    Disconnected,
+}
+
 impl PreemptableReceiver {
     pub fn new(rx: Receiver<Vec<u8>>, preempt_rx: Receiver<()>) -> Self {
         Self {
@@ -178,7 +183,81 @@ impl api::streaming_ttrpc::Streaming for Service {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use containerd_shim::io::Stdio;
+    use crate::io::clean_io;
+
+    #[tokio::test]
+    async fn test_clean_io_removes_streaming_channel() {
+        let stdio = Stdio {
+            stdin: "".to_string(),
+            stdout: "streaming:///test_path_cleanup_io?id=test_stream_123".to_string(),
+            stderr: "".to_string(),
+            terminal: false,
+        };
+        
+        let stream_id = "test_stream_123".to_string();
+        // Emulate registering a channel
+        let _ = STREAMING_SERVICE.get_or_insert_sender(&stream_id).await.unwrap();
+
+        // clean_io will remove the streaming channel that was created
+        clean_io(&stdio).await;
+
+        let has_channel = STREAMING_SERVICE.ios.lock().await.contains_key(&stream_id);
+        assert!(!has_channel, "Streaming channel was not cleaned up");
+    }
+
+    #[test]
+    fn test_map_stdout_stream_event() {
+        let test_cases = vec![
+            (
+                Ok(None),
+                Some(StdoutStreamEvent::Disconnected),
+                None,
+            ),
+            (
+                Ok(Some(Any::new())),
+                None,
+                Some("unexpected message on stdout/stderr stream"),
+            ),
+            (
+                Err(ttrpc::Error::Others("test error".to_string())),
+                None,
+                Some("test error"),
+            ),
+        ];
+
+        for (input, expected_event, expected_err) in test_cases {
+            let res = Service::map_stdout_stream_event(input);
+            match res {
+                Ok(event) => {
+                    assert!(expected_err.is_none());
+                    assert_eq!(event, expected_event.unwrap());
+                }
+                Err(e) => {
+                    assert!(expected_event.is_none());
+                    assert!(e.to_string().contains(expected_err.unwrap()));
+                }
+            }
+        }
+    }
+}
+
 impl Service {
+    fn map_stdout_stream_event(
+        recv_result: ttrpc::Result<Option<Any>>,
+    ) -> ttrpc::Result<StdoutStreamEvent> {
+        match recv_result {
+            Ok(None) => Ok(StdoutStreamEvent::Disconnected),
+            Ok(Some(_)) => Err(ttrpc::Error::Others(
+                "unexpected message on stdout/stderr stream".to_string(),
+            )),
+            Err(e) => Err(e),
+        }
+    }
+
     async fn get_or_insert_sender(&self, id: &str) -> ttrpc::Result<Sender<Vec<u8>>> {
         let mut ios = self.ios.lock().await;
         let ch = ios.entry(id.to_string()).or_insert(IOChannel::new());
@@ -315,7 +394,7 @@ impl Service {
                     window -= len;
                 }
                 None => {
-                    self.ios.lock().await.remove(stream_id);
+                    self.remove_io_channel(stream_id).await;
                     return Ok(());
                 }
             }
@@ -325,7 +404,7 @@ impl Service {
     async fn handle_stdout(
         &self,
         stream_id: &String,
-        stream: ServerStream<Any, Any>,
+        mut stream: ServerStream<Any, Any>,
     ) -> ttrpc::Result<()> {
         let mut receiver = self.preempt_receiver(stream_id).await?;
         if let Some(a) = self.get_remaining_data(stream_id).await {
@@ -337,46 +416,70 @@ impl Service {
             }
         }
         loop {
-            let r = if let Ok(res) = receiver.recv().await {
-                res
-            } else {
-                self.return_preempted_receiver(stream_id, receiver, None)
-                    .await;
-                info!("stream {} is preempted", stream_id);
-                return Err(ttrpc::Error::Others("channel is preempted".to_string()));
-            };
-            match r {
-                Some(d) => {
-                    if d.is_empty() {
-                        return Ok(());
-                    }
-                    let mut data = Data::new();
-                    data.data = d;
-                    let data_bytes = match data.write_to_bytes() {
-                        Ok(b) => b,
-                        Err(e) => {
-                            debug!("failed to marshal data of stream {}, {}", stream_id, e);
+            tokio::select! {
+                result = receiver.recv() => {
+                    let r = match result {
+                        Ok(res) => res,
+                        Err(_) => {
                             self.return_preempted_receiver(stream_id, receiver, None)
                                 .await;
-                            return Err(ttrpc::Error::Others(format!(
-                                "failed to write data {}",
-                                e
-                            )));
+                            info!("stream {} is preempted", stream_id);
+                            return Err(ttrpc::Error::Others("channel is preempted".to_string()));
                         }
                     };
-                    let a = new_any!(Data, data_bytes);
-                    match stream.send(&a).await {
-                        Ok(_) => {}
+                    match r {
+                        Some(d) => {
+                            if d.is_empty() {
+                                return Ok(());
+                            }
+                            let mut data = Data::new();
+                            data.data = d;
+                            let data_bytes = match data.write_to_bytes() {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    debug!("failed to marshal data of stream {}, {}", stream_id, e);
+                                    self.return_preempted_receiver(stream_id, receiver, None)
+                                        .await;
+                                    return Err(ttrpc::Error::Others(format!(
+                                        "failed to write data {}",
+                                        e
+                                    )));
+                                }
+                            };
+                            let a = new_any!(Data, data_bytes);
+                            match stream.send(&a).await {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    debug!("failed to send data of stream {}, {}", stream_id, e);
+                                    self.return_preempted_receiver(stream_id, receiver, Some(a))
+                                        .await;
+                                    return Err(e);
+                                }
+                            };
+                        }
+                        None => {
+                            return Ok(());
+                        }
+                    }
+                }
+                // Monitor the ttrpc stream for client disconnect.
+                // When exec fails, the client closes the stream; detecting this
+                // prevents handle_stdout from blocking forever on receiver.recv().
+                recv_result = stream.recv() => {
+                    match Self::map_stdout_stream_event(recv_result) {
+                        Ok(StdoutStreamEvent::Disconnected) => {
+                            debug!("stream {} client disconnected", stream_id);
+                            self.return_preempted_receiver(stream_id, receiver, None)
+                                .await;
+                            return Ok(());
+                        }
                         Err(e) => {
-                            debug!("failed to send data of stream {}, {}", stream_id, e);
-                            self.return_preempted_receiver(stream_id, receiver, Some(a))
+                            debug!("stream {} recv failed: {}", stream_id, e);
+                            self.return_preempted_receiver(stream_id, receiver, None)
                                 .await;
                             return Err(e);
                         }
-                    };
-                }
-                None => {
-                    return Ok(());
+                    }
                 }
             }
         }

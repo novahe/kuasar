@@ -62,6 +62,29 @@ pub struct ProcessIO {
     pub copy: bool,
 }
 
+impl ProcessIO {
+    pub fn clean(&self) {
+        if let Some(io) = &self.io {
+            io.close_after_start();
+            // The underlying PipedIo only holds RawFd (i32) which does not implement Drop.
+            // When executing `io.stdin()`, `io.stdout()`, and `io.stderr()`, the RawFds
+            // are wrapped into `tokio_pipe::PipeWrite/PipeRead` objects.
+            // These tokio objects implement Drop, which means Rust will automatically
+            // call `close(fd)` when they go out of scope at the end of this block.
+            // If we don't call this on error paths, the RawFds will leak in the system.
+            if let Some(stdin) = io.stdin() {
+                let _ = stdin;
+            }
+            if let Some(stdout) = io.stdout() {
+                let _ = stdout;
+            }
+            if let Some(stderr) = io.stderr() {
+                let _ = stderr;
+            }
+        }
+    }
+}
+
 const VSOCK: &str = "vsock";
 const STREAMING: &str = "streaming";
 
@@ -146,6 +169,18 @@ pub(crate) async fn copy_io_or_console<P>(
         copy_io(&pio, &p.stdio, exit_signal).await?;
     }
     Ok(())
+}
+
+pub async fn clean_io(stdio: &Stdio) {
+    if stdio.stdin.contains(STREAMING) {
+        remove_channel(&stdio.stdin).await.unwrap_or_default();
+    }
+    if stdio.stdout.contains(STREAMING) {
+        remove_channel(&stdio.stdout).await.unwrap_or_default();
+    }
+    if stdio.stderr.contains(STREAMING) {
+        remove_channel(&stdio.stderr).await.unwrap_or_default();
+    }
 }
 
 pub async fn copy_console<P>(
@@ -587,5 +622,51 @@ impl VsockIo {
             vio.stream = Some(stream);
         }
         Ok(vio)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(not(feature = "youki"))]
+    use super::*;
+    #[cfg(not(feature = "youki"))]
+    use containerd_shim::io::Stdio;
+    #[cfg(not(feature = "youki"))]
+    use libc::{getgid, getuid};
+
+    #[tokio::test]
+    #[cfg(not(feature = "youki"))]
+    async fn test_process_io_clean() {
+        let uid = unsafe { getuid() };
+        let gid = unsafe { getgid() };
+
+        let stdio = Stdio {
+            stdin: "".to_string(),
+            stdout: "fifo:///tmp/dummy_out_test_clean".to_string(),
+            stderr: "fifo:///tmp/dummy_err_test_clean".to_string(),
+            terminal: false,
+        };
+        // Just verify pio init and clean won't panic, fd drops internally
+        let pio = create_io("test-id", 0, 0, &stdio).unwrap();
+        let io = pio.io.as_ref().unwrap();
+        pio.clean();
+        assert!(io.stdin().is_none());
+        assert!(io.stdout().is_none());
+        assert!(io.stderr().is_none());
+        drop(pio);
+
+        let stdio_piped = Stdio {
+            stdin: "pipe://".to_string(),
+            stdout: "pipe://".to_string(),
+            stderr: "pipe://".to_string(),
+            terminal: false,
+        };
+        let pio_piped = create_io("test-id-2", uid, gid, &stdio_piped).unwrap();
+        let io_piped = pio_piped.io.as_ref().unwrap();
+        pio_piped.clean();
+        assert!(io_piped.stdin().is_none());
+        assert!(io_piped.stdout().is_none());
+        assert!(io_piped.stderr().is_none());
+        drop(pio_piped);
     }
 }

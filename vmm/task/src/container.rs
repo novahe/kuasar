@@ -62,7 +62,7 @@ use vmm_common::{
 
 use crate::{
     device::rescan_pci_bus,
-    io::{convert_stdio, copy_io_or_console, create_io},
+    io::{clean_io, convert_stdio, copy_io_or_console, create_io},
     sandbox::SandboxResources,
     util::{read_io, read_storages, wait_pid},
 };
@@ -237,6 +237,11 @@ impl KuasarFactory {
             if let Some(s) = socket {
                 s.clean().await;
             }
+            if let Some(pio) = pio {
+                pio.clean();
+                drop(pio);
+            }
+            clean_io(stdio).await;
             return Err(runtime_error(bundle, e, "OCI runtime create failed").await);
         }
         copy_io_or_console(init, socket, pio, init.lifecycle.exit_signal.clone()).await?;
@@ -501,6 +506,11 @@ impl ProcessLifecycle<ExecProcess> for KuasarExecLifecycle {
             if let Some(s) = socket {
                 s.clean().await;
             }
+            if let Some(pio) = pio {
+                pio.clean();
+                drop(pio);
+            }
+            clean_io(&p.stdio).await;
             return Err(runtime_error(&bundle, e, "OCI runtime exec failed").await);
         }
         copy_io_or_console(p, socket, pio, p.lifecycle.exit_signal.clone()).await?;

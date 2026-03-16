@@ -65,7 +65,7 @@ use vmm_common::{
 
 use crate::{
     device::rescan_pci_bus,
-    io::{convert_stdio, copy_io_or_console, ProcessIO},
+    io::{clean_io, convert_stdio, copy_io_or_console, ProcessIO},
     sandbox::SandboxResources,
     util::{read_io, read_storages},
 };
@@ -204,6 +204,14 @@ impl YoukiFactory {
                     if let Err(e) = c.delete(true) {
                         warn!("failed to cleanup container {}", e);
                     }
+                    if let Some(s) = socket {
+                        s.clean().await;
+                    }
+                    if let Some(pio_obj) = pio {
+                        pio_obj.clean();
+                        drop(pio_obj);
+                    }
+                    clean_io(stdio).await;
                     return Err(other!("failed to get pid of the youki container {}", id));
                 };
                 let mut init = InitProcess::new(
@@ -220,6 +228,11 @@ impl YoukiFactory {
                 if let Some(s) = socket {
                     s.clean().await;
                 }
+                if let Some(pio) = pio {
+                    pio.clean();
+                    drop(pio);
+                }
+                clean_io(stdio).await;
                 Err(other!("failed to create container {}", e))
             }
         }
@@ -445,6 +458,11 @@ impl ProcessLifecycle<ExecProcess> for YoukiExecLifecycle {
                 if let Some(s) = socket {
                     s.clean().await;
                 }
+                if let Some(pio) = pio {
+                    pio.clean();
+                    drop(pio);
+                }
+                clean_io(&p.stdio).await;
                 return Err(other!("failed to start youki exec: {}", e));
             }
         }
