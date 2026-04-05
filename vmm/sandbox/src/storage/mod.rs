@@ -457,6 +457,8 @@ mod tests {
             network: None,
             client: Default::default(),
             exit_signal: Default::default(),
+            client_sync_started: false,
+            event_forwarding_started: false,
             sandbox_cgroups: Default::default(),
         };
 
@@ -512,6 +514,8 @@ mod tests {
             network: None,
             client: Default::default(),
             exit_signal: Default::default(),
+            client_sync_started: false,
+            event_forwarding_started: false,
             sandbox_cgroups: Default::default(),
         };
 

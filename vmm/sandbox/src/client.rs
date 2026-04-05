@@ -20,7 +20,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use containerd_sandbox::{
     error::{Error, Result},
     signal::ExitSignal,
@@ -52,15 +52,21 @@ use vmm_common::api::{
     sandbox_ttrpc::SandboxServiceClient,
 };
 
-const HVSOCK_RETRY_TIMEOUT_IN_MS: u64 = 10;
+pub(crate) const HVSOCK_CONNECT_TIMEOUT_IN_MS: u64 = 500;
 // TODO: reduce to 10s
 const NEW_TTRPC_CLIENT_TIMEOUT: u64 = 45;
+pub(crate) const DEFAULT_CLIENT_CHECK_TIMEOUT: u64 = 45;
 const TIME_SYNC_PERIOD: u64 = 60;
 const TIME_DIFF_TOLERANCE_IN_MS: u64 = 10;
 
 pub(crate) async fn new_sandbox_client(address: &str) -> Result<SandboxServiceClient> {
     let client = new_ttrpc_client_with_timeout(address, NEW_TTRPC_CLIENT_TIMEOUT).await?;
     Ok(SandboxServiceClient::new(client))
+}
+
+pub(crate) async fn new_sandbox_client_fail_fast(address: &str) -> Result<SandboxServiceClient> {
+    let fd = connect_to_socket(address).await?;
+    Ok(SandboxServiceClient::new(Client::new(fd)))
 }
 
 async fn new_ttrpc_client_with_timeout(address: &str, t: u64) -> Result<Client> {
@@ -71,9 +77,14 @@ async fn new_ttrpc_client_with_timeout(address: &str, t: u64) -> Result<Client> 
             match connect_to_socket(address).await {
                 Ok(fd) => {
                     let client = Client::new(fd);
-                    return client;
+                    return Ok(client);
                 }
-                Err(e) => last_err = e,
+                Err(e) => {
+                    if is_fatal_error(&e) {
+                        return Err(e);
+                    }
+                    last_err = e;
+                }
             }
             // In case that the address doesn't exist, the executed function in this loop are all
             // sync, making the first time of future poll in timeout hang forever. As a result, the
@@ -85,8 +96,26 @@ async fn new_ttrpc_client_with_timeout(address: &str, t: u64) -> Result<Client> 
 
     let client = timeout(Duration::from_secs(t), fut)
         .await
-        .map_err(|_| anyhow!("{}s timeout connecting socket: {}", t, last_err))?;
+        .map_err(|_| anyhow!("{}s timeout connecting socket: {}", t, last_err))??;
     Ok(client)
+}
+
+fn is_fatal_error(e: &Error) -> bool {
+    match e {
+        Error::IO(err) => is_fatal_io_error(err),
+        Error::Other(err) => err
+            .chain()
+            .filter_map(|source| source.downcast_ref::<std::io::Error>())
+            .any(is_fatal_io_error),
+        _ => false,
+    }
+}
+
+fn is_fatal_io_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+    )
 }
 
 // Supported sock address formats are:
@@ -187,13 +216,13 @@ async fn connect_to_hvsocket(address: &str) -> Result<RawFd> {
         stream
             .write_all(format!("CONNECT {}\n", port).as_bytes())
             .await
-            .map_err(|e| anyhow!("hvsock connected but failed to write CONNECT: {}", e))?;
+            .context("hvsock connected but failed to write CONNECT")?;
 
         let mut response = String::new();
         BufReader::new(&mut stream)
             .read_line(&mut response)
             .await
-            .map_err(|e| anyhow!("CONNECT sent but failed to get response: {}", e))?;
+            .context("CONNECT sent but failed to get response")?;
         if response.starts_with("OK") {
             Ok(stream.into_std()?.into_raw_fd())
         } else {
@@ -201,9 +230,9 @@ async fn connect_to_hvsocket(address: &str) -> Result<RawFd> {
         }
     };
 
-    timeout(Duration::from_millis(HVSOCK_RETRY_TIMEOUT_IN_MS), fut)
+    timeout(Duration::from_millis(HVSOCK_CONNECT_TIMEOUT_IN_MS), fut)
         .await
-        .map_err(|_| anyhow!("hvsock retry {}ms timeout", HVSOCK_RETRY_TIMEOUT_IN_MS))?
+        .map_err(|_| anyhow!("hvsock retry {}ms timeout", HVSOCK_CONNECT_TIMEOUT_IN_MS))?
 }
 
 pub fn unix_sock(r#abstract: bool, socket_path: &str) -> Result<UnixAddr> {
@@ -217,15 +246,14 @@ pub fn unix_sock(r#abstract: bool, socket_path: &str) -> Result<UnixAddr> {
     Ok(sockaddr_u)
 }
 
-pub(crate) async fn client_check(client: &SandboxServiceClient) -> Result<()> {
+pub(crate) async fn client_check(client: &SandboxServiceClient, t_secs: u64) -> Result<()> {
     // the initial timeout is 1, and will grow exponentially
     let retry_timeout = 1;
-    let ctx_timeout = 45;
 
     let res_fut = do_check_agent(client, retry_timeout);
-    timeout(Duration::from_secs(ctx_timeout), res_fut)
+    timeout(Duration::from_secs(t_secs), res_fut)
         .await
-        .map_err(|_| anyhow!("{}s timeout checking", ctx_timeout))?;
+        .map_err(|_| anyhow!("{}s timeout checking", t_secs))?;
     Ok(())
 }
 
@@ -236,6 +264,7 @@ async fn do_check_agent(client: &SandboxServiceClient, timeout: u64) {
         if client.check(with_timeout(duration), &req).await.is_ok() {
             return;
         };
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -358,7 +387,11 @@ pub(crate) async fn publish_event(envelope: Envelope) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::client::{checked_compute_delta, new_ttrpc_client_with_timeout};
+    use std::time::{Duration, Instant};
+
+    use crate::client::{
+        checked_compute_delta, new_sandbox_client_fail_fast, new_ttrpc_client_with_timeout,
+    };
 
     #[tokio::test]
     async fn test_new_ttrpc_client_timeout() {
@@ -366,6 +399,18 @@ mod tests {
         assert!(new_ttrpc_client_with_timeout("hvsock://fake.sock:1024", 1)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_new_sandbox_client_fail_fast() {
+        let start = Instant::now();
+        assert!(new_sandbox_client_fail_fast("hvsock://fake.sock:1024")
+            .await
+            .is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "recovery path should fail fast"
+        );
     }
 
     #[test]

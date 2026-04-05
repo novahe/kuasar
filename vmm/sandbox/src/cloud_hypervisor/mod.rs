@@ -346,7 +346,10 @@ impl VM for CloudHypervisorVM {
 impl crate::vm::Recoverable for CloudHypervisorVM {
     #[instrument(skip_all)]
     async fn recover(&mut self) -> Result<()> {
-        self.client = Some(self.create_client().await?);
+        match self.create_client().await {
+            Ok(client) => self.client = Some(client),
+            Err(e) => warn!("failed to create clh client for {}: {}", self.id, e),
+        }
         let pid = self.pid()?;
         let (tx, rx) = channel((0u32, 0i128));
         tokio::spawn(async move {
