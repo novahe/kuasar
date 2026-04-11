@@ -156,8 +156,9 @@ where
 {
     type Sandbox = KuasarSandbox<F::VM>;
 
-    #[instrument(skip_all)]
     async fn create(&self, id: &str, s: SandboxOption) -> Result<()> {
+        let span = vmm_common::trace::create_trace_span("sandbox.create", id);
+        let _enter = span.enter();
         if self.sandboxes.read().await.get(id).is_some() {
             return Err(Error::AlreadyExist("sandbox".to_string()));
         }
@@ -207,8 +208,9 @@ where
         Ok(())
     }
 
-    #[instrument(skip_all)]
     async fn start(&self, id: &str) -> Result<()> {
+        let span = vmm_common::trace::create_trace_span("sandbox.start", id);
+        let _enter = span.enter();
         let sandbox_mutex = self.sandbox(id).await?;
         let mut sandbox = sandbox_mutex.lock().await;
         self.hooks.pre_start(&mut sandbox).await?;
@@ -276,8 +278,9 @@ where
             .clone())
     }
 
-    #[instrument(skip_all)]
     async fn stop(&self, id: &str, force: bool) -> Result<()> {
+        let span = vmm_common::trace::create_trace_span("sandbox.stop", id);
+        let _enter = span.enter();
         let sandbox_mutex = match self.sandbox(id).await {
             Ok(sb) => sb,
             Err(Error::NotFound(_)) => {
@@ -297,8 +300,9 @@ where
         Ok(())
     }
 
-    #[instrument(skip_all)]
     async fn delete(&self, id: &str) -> Result<()> {
+        let span = vmm_common::trace::create_trace_span("sandbox.delete", id);
+        let _enter = span.enter();
         let sb_clone = self.sandboxes.read().await.clone();
         if let Some(sb_mutex) = sb_clone.get(id) {
             let mut sb = sb_mutex.lock().await;
@@ -349,26 +353,29 @@ where
         Ok(container)
     }
 
-    #[instrument(skip_all)]
     async fn append_container(&mut self, id: &str, options: ContainerOption) -> Result<()> {
+        let span = vmm_common::trace::create_trace_span("sandbox.container.append", &self.id);
+        let _enter = span.enter();
         let handler_chain = self.container_append_handlers(id, options)?;
         handler_chain.handle(self).await?;
         self.dump().await?;
         Ok(())
     }
 
-    #[instrument(skip_all)]
     async fn update_container(&mut self, id: &str, options: ContainerOption) -> Result<()> {
+        let span = vmm_common::trace::create_trace_span("sandbox.container.update", &self.id);
+        let _enter = span.enter();
         let handler_chain = self.container_update_handlers(id, options).await?;
         handler_chain.handle(self).await?;
         self.dump().await?;
         Ok(())
     }
 
-    #[instrument(skip_all)]
     async fn remove_container(&mut self, id: &str) -> Result<()> {
+        let span = vmm_common::trace::create_trace_span("sandbox.container.remove", &self.id);
+        let _enter = span.enter();
         self.deference_container_storages(id).await?;
-
+        
         let bundle = format!("{}/{}", self.get_sandbox_shared_path(), &id);
         if let Err(e) = tokio::fs::remove_dir_all(&*bundle).await {
             if e.kind() != ErrorKind::NotFound {
@@ -483,8 +490,9 @@ impl<V> KuasarSandbox<V>
 where
     V: VM + Sync + Send,
 {
-    #[instrument(skip_all)]
     async fn start(&mut self) -> Result<()> {
+        let span = vmm_common::trace::create_trace_span("sandbox.vm.start", &self.id);
+        let _enter = span.enter();
         let pid = self.vm.start().await?;
 
         if let Err(e) = self.init_client().await {
@@ -509,8 +517,10 @@ where
         Ok(())
     }
 
-    #[instrument(skip_all)]
+    #[instrument(skip_all, fields(sandbox_id = %self.id))]
     async fn stop(&mut self, mut force: bool) -> Result<()> {
+        let span = vmm_common::trace::create_trace_span("sandbox.vm.stop", &self.id);
+        let _enter = span.enter();
         match self.status {
             // If a sandbox is created:
             // 1. Just Created, vmm is not running: roll back and cleanup
@@ -565,8 +575,9 @@ where
         self.id_generator
     }
 
-    #[instrument(skip_all)]
     async fn init_client(&mut self) -> Result<()> {
+        let span = vmm_common::trace::create_trace_span("sandbox.task.connect", &self.id);
+        let _enter = span.enter();
         let mut client_guard = self.client.lock().await;
         if client_guard.is_none() {
             let addr = self.vm.socket_address();
@@ -583,6 +594,8 @@ where
 
     #[instrument(skip_all)]
     pub(crate) async fn setup_sandbox(&mut self) -> Result<()> {
+        let span = vmm_common::trace::create_trace_span("sandbox.task.setup", &self.id);
+        let _enter = span.enter();
         let mut req = SetupSandboxRequest::new();
 
         if let Some(client) = &*self.client.lock().await {
@@ -610,7 +623,7 @@ where
                 req.routes = network.routes().iter().map(|x| x.into()).collect();
             }
 
-            client_setup_sandbox(client, &req).await?;
+            client_setup_sandbox(client, self.id.as_str(), &req).await?;
         }
 
         Ok(())
@@ -678,8 +691,9 @@ where
         format!("{}/{}", self.base_dir, SHARED_DIR_SUFFIX)
     }
 
-    #[instrument(skip_all)]
     pub async fn prepare_network(&mut self) -> Result<()> {
+        let span = vmm_common::trace::create_trace_span("sandbox.network.prepare", &self.id);
+        let _enter = span.enter();
         // get vcpu for interface queue, at least one vcpu
         let mut vcpu = 1;
         if let Some(resources) = get_resources(&self.data) {

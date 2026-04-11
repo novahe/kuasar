@@ -1,23 +1,10 @@
-/*
-Copyright 2024 The Kuasar Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::anyhow;
 use lazy_static::lazy_static;
+use opentelemetry::trace::{SpanContext, TraceContextExt, TraceFlags, TraceState};
 use opentelemetry::{
     global,
     sdk::{
@@ -25,12 +12,15 @@ use opentelemetry::{
         Resource,
     },
 };
+use tracing::Span;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::{
     layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer, Registry,
 };
 
 lazy_static! {
     static ref TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
+    static ref SANDBOX_ID: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
 }
 
 pub fn is_enabled() -> bool {
@@ -39,6 +29,16 @@ pub fn is_enabled() -> bool {
 
 pub fn set_enabled(enabled: bool) {
     TRACE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn set_sandbox_id(id: &str) {
+    if let Ok(mut guard) = SANDBOX_ID.write() {
+        *guard = Some(id.to_string());
+    }
+}
+
+pub fn get_sandbox_id() -> Option<String> {
+    SANDBOX_ID.read().ok().and_then(|guard| guard.clone())
 }
 
 pub fn setup_tracing(log_level: &str, otlp_service_name: &str) -> anyhow::Result<()> {
@@ -82,4 +82,56 @@ pub fn init_otlp_tracer(otlp_service_name: &str) -> anyhow::Result<Tracer> {
 #[allow(dead_code)]
 pub fn shutdown_tracing() {
     global::shutdown_tracer_provider();
+}
+
+pub fn sandbox_id_to_trace_id(sandbox_id: &str) -> [u8; 16] {
+    let mut hasher_low = DefaultHasher::new();
+    sandbox_id.hash(&mut hasher_low);
+    let low = hasher_low.finish();
+
+    let mut hasher_high = DefaultHasher::new();
+    // Use a fixed salt to generate distinct bits for the high 64 bits
+    "kuasar-trace-salt".hash(&mut hasher_high);
+    sandbox_id.hash(&mut hasher_high);
+    let high = hasher_high.finish();
+
+    let mut trace_id = [0u8; 16];
+    trace_id[..8].copy_from_slice(&low.to_le_bytes());
+    trace_id[8..].copy_from_slice(&high.to_le_bytes());
+    trace_id
+}
+
+pub fn create_trace_span(name: &str, sandbox_id: &str) -> Span {
+    let trace_id = opentelemetry::trace::TraceId::from_bytes(sandbox_id_to_trace_id(sandbox_id));
+    let span = tracing::info_span!(target: "kuasar_trace", "dynamic_span", name = name);
+    
+    // Create a SpanContext with the deterministic TraceId and a default SpanId.
+    // Setting SpanId to all zeros (invalid) might cause issues, but usually OTel 
+    // will generate a random SpanId if we don't provide one, while keeping the TraceId.
+    // However, the cleanest way to "seed" the TraceId for a new root span is to
+    // set a remote parent with that TraceId.
+    
+    let span_context = SpanContext::new(
+        trace_id,
+        opentelemetry::trace::SpanId::INVALID,
+        TraceFlags::default(),
+        true, // is_remote
+        TraceState::default(),
+    );
+    
+    span.set_parent(opentelemetry::Context::new().with_remote_span_context(span_context));
+    span
+}
+
+
+pub fn sandbox_id_to_context(sandbox_id: &str) -> opentelemetry::Context {
+    let trace_id = opentelemetry::trace::TraceId::from_bytes(sandbox_id_to_trace_id(sandbox_id));
+    let span_context = SpanContext::new(
+        trace_id,
+        opentelemetry::trace::SpanId::INVALID,
+        TraceFlags::default(),
+        true, // is_remote
+        TraceState::default(),
+    );
+    opentelemetry::Context::new().with_remote_span_context(span_context)
 }

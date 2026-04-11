@@ -45,11 +45,10 @@ use tokio::{
 };
 use ttrpc::{
     context::with_timeout,
-    r#async::{Client, TtrpcContext},
+    r#async::Client,
 };
-use vmm_common::api::{
-    sandbox::{CheckRequest, SetupSandboxRequest, SyncClockPacket},
-    sandbox_ttrpc::SandboxServiceClient,
+use vmm_common::api::sandbox::{
+    CheckRequest, SetupSandboxRequest, SyncClockPacket, sandbox_ttrpc::SandboxServiceClient,
 };
 
 const HVSOCK_RETRY_TIMEOUT_IN_MS: u64 = 10;
@@ -233,14 +232,17 @@ async fn do_check_agent(client: &SandboxServiceClient, timeout: u64) {
     let req = CheckRequest::new();
     let duration = Duration::from_secs(timeout).as_nanos() as i64;
     loop {
+        // We don't have sandbox_id here in do_check_agent, so we use default context
         if client.check(with_timeout(duration), &req).await.is_ok() {
             return;
         };
     }
 }
 
+
 pub(crate) async fn client_setup_sandbox(
     client: &SandboxServiceClient,
+    _sandbox_id: &str,
     config: &SetupSandboxRequest,
 ) -> Result<()> {
     client

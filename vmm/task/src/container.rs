@@ -51,6 +51,7 @@ use tokio::{
     process::{ChildStderr, ChildStdout, Command},
     sync::Mutex,
 };
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing::instrument;
 use vmm_common::{
     mount::get_mount_type,
@@ -109,12 +110,16 @@ pub struct Log {
 
 #[async_trait]
 impl ContainerFactory<KuasarContainer> for KuasarFactory {
-    #[instrument(skip_all)]
     async fn create(
         &self,
         ns: &str,
         req: &CreateTaskRequest,
     ) -> containerd_shim::Result<KuasarContainer> {
+        let span = tracing::info_span!("sandbox.task.create_container", container_id = %req.id);
+        if let Some(sandbox_id) = vmm_common::trace::get_sandbox_id() {
+            span.set_parent(vmm_common::trace::sandbox_id_to_context(&sandbox_id));
+        }
+        let _enter = span.enter();
         rescan_pci_bus().await?;
         let bundle = format!("{}/{}", KUASAR_STATE_DIR, req.id);
         let spec: Spec = read_spec(&bundle).await?;
