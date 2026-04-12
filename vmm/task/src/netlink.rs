@@ -18,6 +18,7 @@ use containerd_shim::{
 };
 use futures::{future, TryStreamExt};
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
+use log::warn;
 use netlink_packet_route::{
     address::{AddressAttribute, AddressMessage},
     link::{LinkAttribute, LinkFlag, LinkMessage},
@@ -224,15 +225,24 @@ impl Handle {
         I: IntoIterator<Item = IpNetwork>,
     {
         for net in list.into_iter() {
-            self.handle
+            let result = self
+                .handle
                 .address()
                 .add(index, net.ip(), net.prefix())
                 .execute()
-                .await
-                .map_err(other_error!(
-                    e,
-                    format!("Failed to add address {}", net.ip())
-                ))?;
+                .await;
+            if let Err(e) = result {
+                if net.is_ipv6() && is_unsupported_netlink_err(&e) {
+                    warn!(
+                        "skip unsupported IPv6 address {} on link {}: {}",
+                        net.ip(),
+                        index,
+                        e
+                    );
+                    continue;
+                }
+                return Err(other!("Failed to add address {}: {}", net.ip(), e));
+            }
         }
 
         Ok(())
@@ -369,7 +379,18 @@ impl Handle {
 
                 if let Err(rtnetlink::Error::NetlinkError(message)) = request.execute().await {
                     if let Some(code) = message.code {
-                        if Errno::from_raw(i32::from(code.abs())) != Errno::EEXIST {
+                        let errno = Errno::from_raw(i32::from(code.abs()));
+                        if errno == Errno::EEXIST {
+                            continue;
+                        }
+                        if is_unsupported_errno(errno) {
+                            warn!(
+                                "skip unsupported IPv6 route (src: {}, dst: {}, gtw: {})",
+                                route.source, route.dest, route.gateway
+                            );
+                            continue;
+                        }
+                        if errno != Errno::EEXIST {
                             return Err(other!(
                                 "Failed to add IP v6 route (src: {}, dst: {}, gtw: {},Err: {})",
                                 route.source,
@@ -647,4 +668,18 @@ fn parse_mac_address(addr: &str) -> Result<[u8; 6]> {
     ];
 
     Ok(arr)
+}
+
+fn is_unsupported_netlink_err(err: &rtnetlink::Error) -> bool {
+    match err {
+        rtnetlink::Error::NetlinkError(message) => message
+            .code
+            .map(|code| is_unsupported_errno(Errno::from_raw(i32::from(code.abs()))))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn is_unsupported_errno(errno: Errno) -> bool {
+    errno == Errno::EOPNOTSUPP || errno == Errno::ENOTSUP || errno == Errno::EAFNOSUPPORT
 }
