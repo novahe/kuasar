@@ -21,12 +21,16 @@ const SHAREFS_TYPE: &str = "task.sharefs_type";
 const LOG_LEVEL: &str = "task.log_level";
 const TASK_DEBUG: &str = "task.debug";
 const ENABLE_TRACING: &str = "task.enable_tracing";
+const OTLP_ENDPOINT: &str = "task.otlp_endpoint";
 const DEBUG_SHELL: &str = "task.debug_shell";
 
 macro_rules! parse_cmdline {
     ($param:ident, $key:ident, $field:expr) => {
         if $param.len() == 1 && $param[0] == $key {
             $field = true;
+            continue;
+        } else if $param.len() == 2 && $param[0] == $key {
+            $field = $param[1] == "true";
             continue;
         }
     };
@@ -45,6 +49,7 @@ pub struct TaskConfig {
     pub(crate) log_level: String,
     pub(crate) debug: bool,
     pub(crate) enable_tracing: bool,
+    pub(crate) otlp_endpoint: String,
     pub(crate) debug_shell: String,
 }
 
@@ -55,6 +60,7 @@ impl Default for TaskConfig {
             log_level: "info".to_string(),
             debug: false,
             enable_tracing: false,
+            otlp_endpoint: "".to_string(),
             debug_shell: "/bin/bash".to_string(),
         }
     }
@@ -62,10 +68,14 @@ impl Default for TaskConfig {
 
 impl TaskConfig {
     pub async fn new() -> Result<Self> {
-        let mut config = TaskConfig::default();
         let cmdline = read_to_string("/proc/cmdline")
             .await
             .map_err(io_error!(e, "failed to open /proc/cmdline"))?;
+        Ok(Self::from_cmdline(&cmdline))
+    }
+
+    fn from_cmdline(cmdline: &str) -> Self {
+        let mut config = TaskConfig::default();
         let params: Vec<&str> = cmdline.split_ascii_whitespace().collect();
         for p in params {
             let param: Vec<&str> = p.split('=').collect();
@@ -73,8 +83,27 @@ impl TaskConfig {
             parse_cmdline!(param, LOG_LEVEL, config.log_level, String::from);
             parse_cmdline!(param, TASK_DEBUG, config.debug);
             parse_cmdline!(param, ENABLE_TRACING, config.enable_tracing);
+            parse_cmdline!(param, OTLP_ENDPOINT, config.otlp_endpoint, String::from);
             parse_cmdline!(param, DEBUG_SHELL, config.debug_shell, String::from);
         }
-        Ok(config)
+        config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TaskConfig;
+
+    #[test]
+    fn test_parse_tracing_cmdline() {
+        let config = TaskConfig::from_cmdline(
+            "console=hvc0 task.enable_tracing=true \
+             task.otlp_endpoint=http://172.20.1.1:4317 \
+             task.debug_shell=/bin/sh",
+        );
+
+        assert!(config.enable_tracing);
+        assert_eq!(config.otlp_endpoint, "http://172.20.1.1:4317");
+        assert_eq!(config.debug_shell, "/bin/sh");
     }
 }

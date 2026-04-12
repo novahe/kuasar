@@ -17,6 +17,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::{
     layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer, Registry,
 };
+use opentelemetry_otlp::WithExportConfig;
 
 lazy_static! {
     static ref TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -68,9 +69,21 @@ fn init_logger_filter(log_level: &str) -> anyhow::Result<EnvFilter> {
 }
 
 pub fn init_otlp_tracer(otlp_service_name: &str) -> anyhow::Result<Tracer> {
+    // Support OTEL_EXPORTER_OTLP_ENDPOINT and OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+    // Default: http://localhost:4317 (OTLP gRPC)
+    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+        .or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT"))
+        .unwrap_or_else(|_| "http://localhost:4317".to_string());
+
+    log::info!("Initializing OTLP tracer with endpoint: {}", endpoint);
+
     let tracer = opentelemetry_otlp::new_pipeline()
         .tracing()
-        .with_exporter(opentelemetry_otlp::new_exporter().tonic())
+        .with_exporter(
+            opentelemetry_otlp::new_exporter()
+                .tonic()
+                .with_endpoint(endpoint)
+        )
         .with_trace_config(trace::config().with_resource(Resource::new(vec![
             opentelemetry::KeyValue::new("service.name", otlp_service_name.to_string()),
         ])))

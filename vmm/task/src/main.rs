@@ -152,6 +152,9 @@ async fn initialize() -> anyhow::Result<TaskConfig> {
     early_init_call().await?;
 
     let config = TaskConfig::new().await?;
+    if !config.otlp_endpoint.is_empty() {
+        std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", &config.otlp_endpoint);
+    }
     trace::set_enabled(config.enable_tracing);
     init_logger(&config.log_level)?;
 

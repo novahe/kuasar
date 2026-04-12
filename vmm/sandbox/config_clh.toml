@@ -1,6 +1,6 @@
 [sandbox]
 log_level = "info"
-enable_tracing = false
+enable_tracing = true
 
 [hypervisor]
 path = "/usr/local/bin/cloud-hypervisor"
@@ -9,14 +9,15 @@ memory_in_mb = 1024
 kernel_path = "/var/lib/kuasar/vmlinux.bin"
 image_path = "/var/lib/kuasar/kuasar.img"
 initrd_path = ""
-kernel_params = ""
+kernel_params = "task.enable_tracing"
 hugepages = false
 entropy_source = "/dev/urandom"
 debug = false
 
 [hypervisor.task]
 debug = false
-enable_tracing = false
+enable_tracing = true
+otlp_endpoint = ""
 
 [hypervisor.virtiofsd]
 path = "/usr/local/bin/virtiofsd"

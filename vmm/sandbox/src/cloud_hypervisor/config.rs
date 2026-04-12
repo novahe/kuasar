@@ -53,6 +53,8 @@ impl Default for CloudHypervisorVMConfig {
 pub struct TaskConfig {
     pub debug: bool,
     pub enable_tracing: bool,
+    #[serde(default)]
+    pub otlp_endpoint: String,
 }
 
 #[derive(CmdLineParamSet, Deserialize, Clone, Serialize)]
@@ -171,6 +173,12 @@ impl CloudHypervisorConfig {
             " task.enable_tracing={}",
             vm_config.task.enable_tracing
         ));
+        if !vm_config.task.otlp_endpoint.is_empty() {
+            cmdline.push_str(&format!(
+                " task.otlp_endpoint={}",
+                vm_config.task.otlp_endpoint
+            ));
+        }
 
         Self {
             path: vm_config.path.to_string(),
@@ -257,6 +265,7 @@ entropy_source = \"/dev/urandom\"
 [hypervisor.task]
 debug = true
 enable_tracing = false
+otlp_endpoint = \"http://172.20.1.1:4317\"
 [hypervisor.virtiofsd]
 path = \"/usr/local/bin/virtiofsd\"
 log_level = \"info\"
@@ -272,6 +281,10 @@ thread_pool_size = 4
         );
         assert_eq!(config.hypervisor.task.debug, true);
         assert_eq!(config.hypervisor.task.enable_tracing, false);
+        assert_eq!(
+            config.hypervisor.task.otlp_endpoint,
+            "http://172.20.1.1:4317"
+        );
 
         assert_eq!(config.hypervisor.common.vcpus, 1);
         assert!(config.hypervisor.hugepages);
@@ -297,6 +310,7 @@ entropy_source = \"/dev/urandom\"
 [hypervisor.task]
 debug = true
 enable_tracing = false
+otlp_endpoint = \"http://172.20.1.1:4317\"
 [hypervisor.virtiofsd]
 path = \"/usr/local/bin/virtiofsd\"
 log_level = \"info\"
@@ -307,6 +321,6 @@ thread_pool_size = 4
         let config: Config<CloudHypervisorVMConfig> = toml::from_str(toml_str).unwrap();
         let chc = CloudHypervisorConfig::from(&config.hypervisor);
 
-        assert_eq!(chc.cmdline, "console=hvc0 root=/dev/pmem0p1 rootflags=data=ordered,errors=remount-ro ro rootfstype=ext4 task.sharefs_type=virtiofs  task.log_level=debug task.enable_tracing=false");
+        assert_eq!(chc.cmdline, "console=hvc0 root=/dev/pmem0p1 rootflags=data=ordered,errors=remount-ro ro rootfstype=ext4 task.sharefs_type=virtiofs  task.log_level=debug task.enable_tracing=false task.otlp_endpoint=http://172.20.1.1:4317");
     }
 }

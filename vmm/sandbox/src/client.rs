@@ -45,10 +45,11 @@ use tokio::{
 };
 use ttrpc::{
     context::with_timeout,
-    r#async::Client,
+    r#async::{Client, TtrpcContext},
 };
-use vmm_common::api::sandbox::{
-    CheckRequest, SetupSandboxRequest, SyncClockPacket, sandbox_ttrpc::SandboxServiceClient,
+use vmm_common::api::{
+    sandbox::{CheckRequest, SetupSandboxRequest, SyncClockPacket},
+    sandbox_ttrpc::SandboxServiceClient,
 };
 
 const HVSOCK_RETRY_TIMEOUT_IN_MS: u64 = 10;
