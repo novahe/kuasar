@@ -730,7 +730,6 @@ dependencies = [
 [[package]]
 name = "containerd-shim"
 version = "0.3.0"
-source = "git+https://github.com/kuasar-io/rust-extensions.git#1127b78fd29f55853f63a1146748ad33b25ca6b7"
 dependencies = [
  "async-trait",
  "cgroups-rs 0.2.11",
@@ -755,6 +754,7 @@ dependencies = [
  "thiserror 1.0.69",
  "time",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -778,7 +778,6 @@ dependencies = [
 [[package]]
 name = "containerd-shim-protos"
 version = "0.2.0"
-source = "git+https://github.com/kuasar-io/rust-extensions.git#1127b78fd29f55853f63a1146748ad33b25ca6b7"
 dependencies = [
  "async-trait",
  "protobuf 3.2.0",
@@ -3756,7 +3755,6 @@ dependencies = [
 [[package]]
 name = "runc"
 version = "0.2.0"
-source = "git+https://github.com/kuasar-io/rust-extensions.git#1127b78fd29f55853f63a1146748ad33b25ca6b7"
 dependencies = [
  "async-trait",
  "futures",

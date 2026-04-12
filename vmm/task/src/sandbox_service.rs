@@ -29,13 +29,13 @@ use containerd_shim::{
     util::convert_to_any,
     Error, TtrpcContext, TtrpcResult,
 };
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 use log::debug;
 use nix::{
     sys::time::{TimeSpec, TimeValLike},
     time::{clock_gettime, clock_settime, ClockId},
 };
 use tokio::sync::{mpsc::Receiver, Mutex};
+use tracing::Instrument;
 use vmm_common::{
     api,
     api::{
@@ -79,17 +79,21 @@ impl api::sandbox_ttrpc::SandboxService for SandboxService {
         _ctx: &TtrpcContext,
         req: UpdateInterfacesRequest,
     ) -> TtrpcResult<Empty> {
-        let span = tracing::info_span!("sandbox.task.update_interfaces");
-        if let Some(id) = vmm_common::trace::get_sandbox_id() {
-            span.set_parent(vmm_common::trace::sandbox_id_to_context(&id));
+        let span = if let Some(id) = vmm_common::trace::get_sandbox_id() {
+            vmm_common::trace::create_trace_span("sandbox.task.update_interfaces", &id)
+        } else {
+            tracing::info_span!("sandbox.task.update_interfaces")
+        };
+        async {
+            self.handle
+                .lock()
+                .await
+                .update_interfaces(req.interfaces)
+                .await?;
+            Ok(Empty::new())
         }
-        let _enter = span.enter();
-        self.handle
-            .lock()
-            .await
-            .update_interfaces(req.interfaces)
-            .await?;
-        Ok(Empty::new())
+        .instrument(span)
+        .await
     }
 
     async fn update_routes(
@@ -97,13 +101,17 @@ impl api::sandbox_ttrpc::SandboxService for SandboxService {
         _ctx: &TtrpcContext,
         req: UpdateRoutesRequest,
     ) -> TtrpcResult<Empty> {
-        let span = tracing::info_span!("sandbox.task.update_routes");
-        if let Some(id) = vmm_common::trace::get_sandbox_id() {
-            span.set_parent(vmm_common::trace::sandbox_id_to_context(&id));
+        let span = if let Some(id) = vmm_common::trace::get_sandbox_id() {
+            vmm_common::trace::create_trace_span("sandbox.task.update_routes", &id)
+        } else {
+            tracing::info_span!("sandbox.task.update_routes")
+        };
+        async {
+            self.handle.lock().await.update_routes(req.routes).await?;
+            Ok(Empty::new())
         }
-        let _enter = span.enter();
-        self.handle.lock().await.update_routes(req.routes).await?;
-        Ok(Empty::new())
+        .instrument(span)
+        .await
     }
 
     async fn setup_sandbox(
@@ -111,8 +119,6 @@ impl api::sandbox_ttrpc::SandboxService for SandboxService {
         _ctx: &TtrpcContext,
         req: SetupSandboxRequest,
     ) -> TtrpcResult<Empty> {
-        let span = tracing::info_span!("sandbox.task.setup");
-        let _enter = span.enter();
         match req.config.type_url.as_str() {
             "PodSandboxConfig" => {
                 let config =
@@ -120,16 +126,28 @@ impl api::sandbox_ttrpc::SandboxService for SandboxService {
                         .map_err(|e| {
                             ttrpc::Error::Others(format!("convert PodSandboxConfig failed: {}", e))
                         })?;
-                
-                // Resolution of sandbox_id from PodSandboxConfig metadata
-                if let Some(metadata) = config.metadata.as_ref() {
+
+                let span = if let Some(metadata) = config.metadata.as_ref() {
                     let sandbox_id = &metadata.uid;
                     vmm_common::trace::set_sandbox_id(sandbox_id);
-                    // Update current span's parent now that we know the sandbox_id
-                    span.set_parent(vmm_common::trace::sandbox_id_to_context(sandbox_id));
-                }
+                    vmm_common::trace::create_trace_span("sandbox.task.setup", sandbox_id)
+                } else {
+                    tracing::info_span!("sandbox.task.setup")
+                };
+                async {
+                    setup_sandbox(&config).await?;
 
-                setup_sandbox(&config).await?;
+                    self.handle
+                        .lock()
+                        .await
+                        .update_interfaces(req.interfaces)
+                        .await?;
+
+                    self.handle.lock().await.update_routes(req.routes).await?;
+                    Ok::<(), ttrpc::Error>(())
+                }
+                .instrument(span)
+                .await?;
             }
             _ => {
                 return Err(ttrpc::Error::RpcStatus(ttrpc::get_status(
@@ -142,24 +160,15 @@ impl api::sandbox_ttrpc::SandboxService for SandboxService {
             }
         }
 
-        // Set interfaces
-        self.handle
-            .lock()
-            .await
-            .update_interfaces(req.interfaces)
-            .await?;
-
-        // Set Routes
-        self.handle.lock().await.update_routes(req.routes).await?;
-
         Ok(Empty::new())
     }
 
     async fn check(&self, _ctx: &TtrpcContext, _req: CheckRequest) -> TtrpcResult<Empty> {
-        let span = tracing::info_span!("sandbox.task.check");
-        if let Some(id) = vmm_common::trace::get_sandbox_id() {
-            span.set_parent(vmm_common::trace::sandbox_id_to_context(&id));
-        }
+        let span = if let Some(id) = vmm_common::trace::get_sandbox_id() {
+            vmm_common::trace::create_trace_span("sandbox.task.check", &id)
+        } else {
+            tracing::info_span!("sandbox.task.check")
+        };
         let _enter = span.enter();
         Ok(Empty::new())
     }
@@ -169,16 +178,20 @@ impl api::sandbox_ttrpc::SandboxService for SandboxService {
         _ctx: &TtrpcContext,
         req: ExecVMProcessRequest,
     ) -> TtrpcResult<ExecVMProcessResponse> {
-        let span = tracing::info_span!("sandbox.task.exec_vm");
-        if let Some(id) = vmm_common::trace::get_sandbox_id() {
-            span.set_parent(vmm_common::trace::sandbox_id_to_context(&id));
-        }
-        let _enter = span.enter();
-        let out = do_execute_cmd(&req.command, req.stdin.as_slice()).await?;
+        let span = if let Some(id) = vmm_common::trace::get_sandbox_id() {
+            vmm_common::trace::create_trace_span("sandbox.task.exec_vm", &id)
+        } else {
+            tracing::info_span!("sandbox.task.exec_vm")
+        };
+        async {
+            let out = do_execute_cmd(&req.command, req.stdin.as_slice()).await?;
 
-        let mut resp = ExecVMProcessResponse::new();
-        resp.out = out;
-        Ok(resp)
+            let mut resp = ExecVMProcessResponse::new();
+            resp.out = out;
+            Ok(resp)
+        }
+        .instrument(span)
+        .await
     }
 
     async fn sync_clock(
@@ -186,31 +199,35 @@ impl api::sandbox_ttrpc::SandboxService for SandboxService {
         _ctx: &TtrpcContext,
         req: SyncClockPacket,
     ) -> TtrpcResult<SyncClockPacket> {
-        let span = tracing::info_span!("sandbox.task.sync_clock");
-        if let Some(id) = vmm_common::trace::get_sandbox_id() {
-            span.set_parent(vmm_common::trace::sandbox_id_to_context(&id));
-        }
-        let _enter = span.enter();
-        let mut resp = req.clone();
-        let clock_id = ClockId::from_raw(nix::libc::CLOCK_REALTIME);
-        match req.Delta {
-            0 => {
-                resp.ClientArriveTime = clock_gettime(clock_id)
-                    .map_err(Error::Nix)?
-                    .num_nanoseconds();
-                resp.ServerSendTime = clock_gettime(clock_id)
-                    .map_err(Error::Nix)?
-                    .num_nanoseconds();
+        let span = if let Some(id) = vmm_common::trace::get_sandbox_id() {
+            vmm_common::trace::create_trace_span("sandbox.task.sync_clock", &id)
+        } else {
+            tracing::info_span!("sandbox.task.sync_clock")
+        };
+        async {
+            let mut resp = req.clone();
+            let clock_id = ClockId::from_raw(nix::libc::CLOCK_REALTIME);
+            match req.Delta {
+                0 => {
+                    resp.ClientArriveTime = clock_gettime(clock_id)
+                        .map_err(Error::Nix)?
+                        .num_nanoseconds();
+                    resp.ServerSendTime = clock_gettime(clock_id)
+                        .map_err(Error::Nix)?
+                        .num_nanoseconds();
+                }
+                _ => {
+                    let mut clock_spce = clock_gettime(clock_id).map_err(Error::Nix)?;
+                    clock_spce = clock_spce.add(TimeSpec::from_duration(Duration::from_nanos(
+                        req.Delta as u64,
+                    )));
+                    clock_settime(clock_id, clock_spce).map_err(Error::Nix)?;
+                }
             }
-            _ => {
-                let mut clock_spce = clock_gettime(clock_id).map_err(Error::Nix)?;
-                clock_spce = clock_spce.add(TimeSpec::from_duration(Duration::from_nanos(
-                    req.Delta as u64,
-                )));
-                clock_settime(clock_id, clock_spce).map_err(Error::Nix)?;
-            }
+            Ok(resp)
         }
-        Ok(resp)
+        .instrument(span)
+        .await
     }
 
     async fn get_events(&self, _ctx: &TtrpcContext, _: Empty) -> TtrpcResult<Envelope> {

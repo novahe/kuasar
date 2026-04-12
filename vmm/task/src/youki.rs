@@ -58,9 +58,10 @@ use tokio::{
     sync::Mutex,
     task::spawn_blocking,
 };
+use tracing::{info_span, Instrument};
 use vmm_common::{
     storage::{Storage, ANNOTATION_KEY_STORAGE},
-    KUASAR_STATE_DIR,
+    trace, KUASAR_STATE_DIR,
 };
 
 use crate::{
@@ -89,53 +90,56 @@ impl ContainerFactory<YoukiContainer> for YoukiFactory {
         _ns: &str,
         req: &CreateTaskRequest,
     ) -> containerd_shim::Result<YoukiContainer> {
-        rescan_pci_bus().await?;
-        let bundle = format!("{}/{}", KUASAR_STATE_DIR, req.id);
-        let spec: Spec = read_spec(&bundle).await?;
-        let annotations = spec.annotations().clone().unwrap_or_default();
-        let storages = if let Some(storage_str) = annotations.get(ANNOTATION_KEY_STORAGE) {
-            serde_json::from_str::<Vec<Storage>>(storage_str)?
-        } else {
-            read_storages(&bundle, req.id()).await?
-        };
-        self.sandbox
-            .lock()
-            .await
-            .add_storages(req.id(), storages)
-            .await?;
-        let mut opts = Options::new();
-        if let Some(any) = req.options.as_ref() {
-            let mut input = CodedInputStream::from_bytes(any.value.as_ref());
-            opts.merge_from(&mut input)?;
-        }
-        if opts.compute_size() > 0 {
-            debug!("create options: {:?}", &opts);
-        }
+        let span = create_task_span("sandbox.task.create_container")
+            .unwrap_or_else(|| info_span!("sandbox.task.create_container", container_id = %req.id));
+        async {
+            rescan_pci_bus().await?;
+            let bundle = format!("{}/{}", KUASAR_STATE_DIR, req.id);
+            let spec: Spec = read_spec(&bundle).await?;
+            let annotations = spec.annotations().clone().unwrap_or_default();
+            let storages = if let Some(storage_str) = annotations.get(ANNOTATION_KEY_STORAGE) {
+                serde_json::from_str::<Vec<Storage>>(storage_str)?
+            } else {
+                read_storages(&bundle, req.id()).await?
+            };
+            self.sandbox
+                .lock()
+                .await
+                .add_storages(req.id(), storages)
+                .await?;
+            let mut opts = Options::new();
+            if let Some(any) = req.options.as_ref() {
+                let mut input = CodedInputStream::from_bytes(any.value.as_ref());
+                opts.merge_from(&mut input)?;
+            }
+            if opts.compute_size() > 0 {
+                debug!("create options: {:?}", &opts);
+            }
 
-        let id = req.id();
+            let id = req.id();
 
-        let stdio = match read_io(&bundle, req.id(), None).await {
-            Ok(io) => Stdio::new(&io.stdin, &io.stdout, &io.stderr, io.terminal),
-            Err(_) => Stdio::new(req.stdin(), req.stdout(), req.stderr(), req.terminal()),
-        };
+            let stdio = match read_io(&bundle, req.id(), None).await {
+                Ok(io) => Stdio::new(&io.stdin, &io.stdout, &io.stderr, io.terminal),
+                Err(_) => Stdio::new(req.stdin(), req.stdout(), req.stderr(), req.terminal()),
+            };
 
-        // for qemu, the io path is pci address for virtio-serial
-        // that needs to be converted to the serial file path
-        let stdio = convert_stdio(&stdio).await?;
-
-        let init = self.do_create(id, &stdio, &opts, &bundle).await?;
-        let container = YoukiContainer {
-            id: id.to_string(),
-            bundle: bundle.to_string(),
-            init,
-            process_factory: YoukiExecFactory {
+            let stdio = convert_stdio(&stdio).await?;
+            let init = self.do_create(id, &stdio, &opts, &bundle).await?;
+            let container = YoukiContainer {
+                id: id.to_string(),
                 bundle: bundle.to_string(),
-                io_uid: opts.io_uid,
-                io_gid: opts.io_gid,
-            },
-            processes: Default::default(),
-        };
-        Ok(container)
+                init,
+                process_factory: YoukiExecFactory {
+                    bundle: bundle.to_string(),
+                    io_uid: opts.io_uid,
+                    io_gid: opts.io_gid,
+                },
+                processes: Default::default(),
+            };
+            Ok(container)
+        }
+        .instrument(span)
+        .await
     }
 
     async fn cleanup(&self, _ns: &str, c: &YoukiContainer) -> containerd_shim::Result<()> {
@@ -234,32 +238,42 @@ pub struct YoukiExecFactory {
 #[async_trait]
 impl ProcessFactory<ExecProcess> for YoukiExecFactory {
     async fn create(&self, req: &ExecProcessRequest) -> Result<ExecProcess> {
-        let p = get_spec_from_request(req)?;
-        let stdio = match read_io(&self.bundle, req.id(), Some(req.exec_id())).await {
-            // terminal is still determined from request
-            Ok(io) => Stdio::new(&io.stdin, &io.stdout, &io.stderr, req.terminal()),
-            Err(_) => Stdio::new(req.stdin(), req.stdout(), req.stderr(), req.terminal()),
-        };
-        let stdio = convert_stdio(&stdio).await?;
-        Ok(ExecProcess {
-            state: Status::CREATED,
-            id: req.exec_id.to_string(),
-            stdio,
-            pid: 0,
-            exit_code: 0,
-            exited_at: None,
-            wait_chan_tx: vec![],
-            console: None,
-            lifecycle: Arc::from(YoukiExecLifecycle {
-                bundle: self.bundle.to_string(),
-                container_id: req.id.to_string(),
-                io_uid: self.io_uid,
-                io_gid: self.io_gid,
-                spec: p,
-                exit_signal: Default::default(),
-            }),
-            stdin: Arc::new(Mutex::new(None)),
-        })
+        let span = create_task_span("sandbox.task.create_exec").unwrap_or_else(|| {
+            info_span!(
+                "sandbox.task.create_exec",
+                container_id = %req.id,
+                exec_id = %req.exec_id
+            )
+        });
+        async {
+            let p = get_spec_from_request(req)?;
+            let stdio = match read_io(&self.bundle, req.id(), Some(req.exec_id())).await {
+                Ok(io) => Stdio::new(&io.stdin, &io.stdout, &io.stderr, req.terminal()),
+                Err(_) => Stdio::new(req.stdin(), req.stdout(), req.stderr(), req.terminal()),
+            };
+            let stdio = convert_stdio(&stdio).await?;
+            Ok(ExecProcess {
+                state: Status::CREATED,
+                id: req.exec_id.to_string(),
+                stdio,
+                pid: 0,
+                exit_code: 0,
+                exited_at: None,
+                wait_chan_tx: vec![],
+                console: None,
+                lifecycle: Arc::from(YoukiExecLifecycle {
+                    bundle: self.bundle.to_string(),
+                    container_id: req.id.to_string(),
+                    io_uid: self.io_uid,
+                    io_gid: self.io_gid,
+                    spec: p,
+                    exit_signal: Default::default(),
+                }),
+                stdin: Arc::new(Mutex::new(None)),
+            })
+        }
+        .instrument(span)
+        .await
     }
 }
 
@@ -271,14 +285,20 @@ pub struct YoukiInitLifecycle {
 #[async_trait]
 impl ProcessLifecycle<InitProcess> for YoukiInitLifecycle {
     async fn start(&self, p: &mut InitProcess) -> containerd_shim::Result<()> {
-        p.lifecycle
-            .youki_container
-            .lock()
-            .await
-            .start()
-            .map_err(other_error!(e, "failed to start container "))?;
-        p.state = Status::RUNNING;
-        Ok(())
+        let span = create_task_span("sandbox.task.start_init")
+            .unwrap_or_else(|| info_span!("sandbox.task.start_init", process_id = %p.id));
+        async {
+            p.lifecycle
+                .youki_container
+                .lock()
+                .await
+                .start()
+                .map_err(other_error!(e, "failed to start container "))?;
+            p.state = Status::RUNNING;
+            Ok(())
+        }
+        .instrument(span)
+        .await
     }
 
     async fn kill(
@@ -287,33 +307,51 @@ impl ProcessLifecycle<InitProcess> for YoukiInitLifecycle {
         signal: u32,
         all: bool,
     ) -> containerd_shim::Result<()> {
-        let signal = Signal::try_from(signal as i32)
-            .map_err(other_error!(e, "failed to parse kill signal "))?;
-        p.lifecycle
-            .youki_container
-            .lock()
-            .await
-            .kill(signal, all)
-            .or_else(|e| {
-                if let LibcontainerError::IncorrectStatus(_) = e {
-                    Ok(())
-                } else {
-                    Err(e)
-                }
-            })
-            .map_err(other_error!(e, "failed to kill container "))?;
-        Ok(())
+        let span = create_task_span("sandbox.task.kill_init").unwrap_or_else(|| {
+            info_span!(
+                "sandbox.task.kill_init",
+                process_id = %p.id,
+                signal,
+                all
+            )
+        });
+        async {
+            let signal = Signal::try_from(signal as i32)
+                .map_err(other_error!(e, "failed to parse kill signal "))?;
+            p.lifecycle
+                .youki_container
+                .lock()
+                .await
+                .kill(signal, all)
+                .or_else(|e| {
+                    if let LibcontainerError::IncorrectStatus(_) = e {
+                        Ok(())
+                    } else {
+                        Err(e)
+                    }
+                })
+                .map_err(other_error!(e, "failed to kill container "))?;
+            Ok(())
+        }
+        .instrument(span)
+        .await
     }
 
     async fn delete(&self, p: &mut InitProcess) -> containerd_shim::Result<()> {
-        p.lifecycle
-            .youki_container
-            .lock()
-            .await
-            .delete(true)
-            .map_err(other_error!(e, "failed to delete container "))?;
-        self.exit_signal.signal();
-        Ok(())
+        let span = create_task_span("sandbox.task.delete_init")
+            .unwrap_or_else(|| info_span!("sandbox.task.delete_init", process_id = %p.id));
+        async {
+            p.lifecycle
+                .youki_container
+                .lock()
+                .await
+                .delete(true)
+                .map_err(other_error!(e, "failed to delete container "))?;
+            self.exit_signal.signal();
+            Ok(())
+        }
+        .instrument(span)
+        .await
     }
 
     #[cfg(target_os = "linux")]
@@ -382,71 +420,77 @@ pub struct YoukiExecLifecycle {
 #[async_trait]
 impl ProcessLifecycle<ExecProcess> for YoukiExecLifecycle {
     async fn start(&self, p: &mut ExecProcess) -> containerd_shim::Result<()> {
-        rescan_pci_bus().await?;
-        let (socket, pio, container_io) = if p.stdio.terminal {
-            let s = ConsoleSocket::new().await?;
-            (Some(s), None, None)
-        } else {
-            let (pio, container_io) = create_io(&p.id, self.io_uid, self.io_gid, &p.stdio)?;
-            (None, Some(pio), Some(container_io))
-        };
+        let span = create_task_span("sandbox.task.start_exec")
+            .unwrap_or_else(|| info_span!("sandbox.task.start_exec", exec_id = %p.id));
+        async {
+            rescan_pci_bus().await?;
+            let (socket, pio, container_io) = if p.stdio.terminal {
+                let s = ConsoleSocket::new().await?;
+                (Some(s), None, None)
+            } else {
+                let (pio, container_io) = create_io(&p.id, self.io_uid, self.io_gid, &p.stdio)?;
+                (None, Some(pio), Some(container_io))
+            };
 
-        let probe_path = format!("{}/{}-process.json", self.bundle, &p.id);
-        let spec_str = serde_json::to_string(&self.spec)
-            .map_err(other_error!(e, "failed to marshall exec spec to string"))?;
-        tokio::fs::write(&probe_path, &spec_str)
+            let probe_path = format!("{}/{}-process.json", self.bundle, &p.id);
+            let spec_str = serde_json::to_string(&self.spec)
+                .map_err(other_error!(e, "failed to marshall exec spec to string"))?;
+            tokio::fs::write(&probe_path, &spec_str)
+                .await
+                .map_err(other_error!(e, "failed to write spec to process.json"))?;
+
+            let container_id = self.container_id.clone();
+            let socket_path = socket.as_ref().map(|p| p.path.clone());
+            let probe_path_clone = probe_path.clone();
+            let exec_result = spawn_blocking(move || {
+                let mut builder = ContainerBuilder::new(container_id, SyscallType::default())
+                    .with_root_path(PathBuf::from(YOUKI_DIR))
+                    .map_err(other_error!(e, "failed to set youki root path"))?
+                    .with_console_socket(socket_path);
+                if let Some(f) = container_io {
+                    if let Some(fd) = f.stdin {
+                        builder = builder.with_stdin(fd);
+                    }
+                    if let Some(fd) = f.stdout {
+                        builder = builder.with_stdout(fd);
+                    }
+                    if let Some(fd) = f.stderr {
+                        builder = builder.with_stderr(fd);
+                    }
+                }
+
+                builder
+                    .as_tenant()
+                    .with_detach(true)
+                    .with_process(Some(&probe_path_clone))
+                    .build()
+                    .map_err(other_error!(
+                        e,
+                        "failed to exec process in youki container "
+                    ))
+            })
             .await
-            .map_err(other_error!(e, "failed to write spec to process.json"))?;
-
-        let container_id = self.container_id.clone();
-        let socket_path = socket.as_ref().map(|p| p.path.clone());
-        let probe_path_clone = probe_path.clone();
-        let exec_result = spawn_blocking(move || {
-            let mut builder = ContainerBuilder::new(container_id, SyscallType::default())
-                .with_root_path(PathBuf::from(YOUKI_DIR))
-                .map_err(other_error!(e, "failed to set youki root path"))?
-                .with_console_socket(socket_path);
-            if let Some(f) = container_io {
-                if let Some(fd) = f.stdin {
-                    builder = builder.with_stdin(fd);
+            .map_err(other_error!(e, "failed to wait exec thread "))?;
+            tokio::fs::remove_file(&probe_path)
+                .await
+                .unwrap_or_default();
+            match exec_result {
+                Ok(pid) => {
+                    copy_io_or_console(p, socket, pio, p.lifecycle.exit_signal.clone()).await?;
+                    p.pid = pid.as_raw();
+                    p.state = Status::RUNNING;
                 }
-                if let Some(fd) = f.stdout {
-                    builder = builder.with_stdout(fd);
-                }
-                if let Some(fd) = f.stderr {
-                    builder = builder.with_stderr(fd);
+                Err(e) => {
+                    if let Some(s) = socket {
+                        s.clean().await;
+                    }
+                    return Err(other!("failed to start youki exec: {}", e));
                 }
             }
-
-            builder
-                .as_tenant()
-                .with_detach(true)
-                .with_process(Some(&probe_path_clone))
-                .build()
-                .map_err(other_error!(
-                    e,
-                    "failed to exec process in youki container "
-                ))
-        })
-        .await
-        .map_err(other_error!(e, "failed to wait exec thread "))?;
-        tokio::fs::remove_file(&probe_path)
-            .await
-            .unwrap_or_default();
-        match exec_result {
-            Ok(pid) => {
-                copy_io_or_console(p, socket, pio, p.lifecycle.exit_signal.clone()).await?;
-                p.pid = pid.as_raw();
-                p.state = Status::RUNNING;
-            }
-            Err(e) => {
-                if let Some(s) = socket {
-                    s.clean().await;
-                }
-                return Err(other!("failed to start youki exec: {}", e));
-            }
+            Ok(())
         }
-        Ok(())
+        .instrument(span)
+        .await
     }
 
     async fn kill(
@@ -455,25 +499,36 @@ impl ProcessLifecycle<ExecProcess> for YoukiExecLifecycle {
         signal: u32,
         _all: bool,
     ) -> containerd_shim::Result<()> {
-        if p.pid <= 0 {
-            Err(Error::FailedPreconditionError(
-                "process not created".to_string(),
-            ))
-        } else if p.exited_at.is_some() {
-            Err(Error::NotFoundError("process already finished".to_string()))
-        } else {
-            // TODO this is kill from nix crate, it is os specific, maybe have annotated with target os
-            kill(
-                Pid::from_raw(p.pid),
-                nix::sys::signal::Signal::try_from(signal as i32).unwrap(),
-            )
-            .map_err(Into::into)
+        let span = create_task_span("sandbox.task.kill_exec")
+            .unwrap_or_else(|| info_span!("sandbox.task.kill_exec", exec_id = %p.id, signal));
+        async {
+            if p.pid <= 0 {
+                Err(Error::FailedPreconditionError(
+                    "process not created".to_string(),
+                ))
+            } else if p.exited_at.is_some() {
+                Err(Error::NotFoundError("process already finished".to_string()))
+            } else {
+                kill(
+                    Pid::from_raw(p.pid),
+                    nix::sys::signal::Signal::try_from(signal as i32).unwrap(),
+                )
+                .map_err(Into::into)
+            }
         }
+        .instrument(span)
+        .await
     }
 
     async fn delete(&self, _p: &mut ExecProcess) -> containerd_shim::Result<()> {
-        self.exit_signal.signal();
-        Ok(())
+        let span = create_task_span("sandbox.task.delete_exec")
+            .unwrap_or_else(|| info_span!("sandbox.task.delete_exec"));
+        async {
+            self.exit_signal.signal();
+            Ok(())
+        }
+        .instrument(span)
+        .await
     }
 
     async fn update(&self, _p: &mut ExecProcess, _resources: &LinuxResources) -> Result<()> {
@@ -661,4 +716,9 @@ fn get_spec_from_request(
     } else {
         Err(Error::InvalidArgument("no spec in request".to_string()))
     }
+}
+
+fn create_task_span(name: &str) -> Option<tracing::Span> {
+    trace::get_sandbox_id()
+        .map(|sandbox_id| trace::create_trace_span(name, &sandbox_id))
 }
