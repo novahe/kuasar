@@ -1,0 +1,28 @@
+[workspace]
+members = [
+    "crates/client",
+    "crates/logging",
+    "crates/shim-protos",
+    "crates/shim",
+    "crates/snapshots",
+    "crates/runc",
+    "crates/runc-shim",
+    "crates/sandbox",
+]
+
+[profile.release]
+# Keep binary as small as possible
+# https://doc.rust-lang.org/book/ch09-01-unrecoverable-errors-with-panic.html
+panic = 'abort'
+
+# Common for all crates
+# See https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html#inheriting-a-dependency-from-a-workspace
+[workspace.package]
+license = "Apache-2.0"
+repository = "https://github.com/containerd/rust-extensions"
+homepage = "https://containerd.io"
+edition = "2018"
+
+[patch.crates-io]
+ttrpc = {git = "https://github.com/kuasar-io/ttrpc-rust.git", branch = "v0.7.1-kuasar"}
+ttrpc-codegen = {git = "https://github.com/kuasar-io/ttrpc-rust.git", branch = "v0.7.1-kuasar"}

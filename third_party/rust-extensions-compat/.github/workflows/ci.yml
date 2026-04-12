@@ -1,0 +1,157 @@
+name: CI
+on:
+  pull_request:
+  push:
+  schedule:
+    - cron: '0 0 * * *' # Every day at midnight
+
+jobs:
+  checks:
+    name: Checks
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v3
+      - uses: arduino/setup-protoc@v1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - run: cargo check --examples --tests --all-targets
+      - run: cargo check --examples --tests --all-targets --all-features
+
+      - run: rustup toolchain install nightly --component rustfmt
+      - run: cargo +nightly fmt --all -- --check --files-with-diff
+
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+
+  tests:
+    name: Tests
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v3
+      - uses: arduino/setup-protoc@v1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - env:
+          # runc::tests::test_exec needs $XDG_RUNTIME_DIR to be set
+          XDG_RUNTIME_DIR: /tmp/dummy-xdr
+        run: |
+          # runc-shim::cgroup::test_add_cgroup needs root permission to set cgroup
+          mkdir -p /tmp/dummy-xdr
+          export PROTOC=$(which protoc)
+          sudo -E $(command -v cargo) test
+          sudo -E $(command -v cargo) test --all-features
+
+  # Collect build timings
+  # See https://blog.rust-lang.org/2022/04/07/Rust-1.60.0.html#cargo---timings
+  timings:
+    name: Timings
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v3
+      - uses: arduino/setup-protoc@v1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - run: cargo build --all-features --timings
+      - uses: actions/upload-artifact@v3
+        with:
+          name: cargo-timing
+          path: target/cargo-timings/cargo-timing.html
+          if-no-files-found: error
+
+  deny:
+    name: Deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v3
+      - uses: EmbarkStudios/cargo-deny-action@v1
+
+  integration:
+    name: Integration
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        containerd: [v1.5.13, v1.6.8]
+
+    steps:
+      - name: Checkout extensions
+        uses: actions/checkout@v3
+
+      - uses: actions/setup-go@v3
+        with:
+          go-version: '1.17.5'
+
+      # This step is required for containerd v1.5.x and below
+      - name: Setup GOPATH
+        shell: bash
+        run: |
+          echo "GOPATH=${{ github.workspace }}" >> $GITHUB_ENV
+          echo "${{ github.workspace }}/bin" >> $GITHUB_PATH
+
+      - name: Checkout containerd
+        uses: actions/checkout@v3
+        with:
+          repository: containerd/containerd
+          path: src/github.com/containerd/containerd
+          ref: ${{ matrix.containerd }}
+
+      - name: Install containerd
+        env:
+          GOFLAGS: -modcacherw
+          CGO_ENABLED: 1
+        run: |
+          # Install containerd dependencies first
+          sudo apt-get install -y gperf
+          sudo -E PATH=$PATH script/setup/install-seccomp
+          sudo -E PATH=$PATH script/setup/install-runc
+          sudo -E PATH=$PATH script/setup/install-cni $(grep containernetworking/plugins go.mod | awk '{print $2}')
+          # Install containerd
+          make bin/containerd GO_BUILD_FLAGS="-mod=vendor" BUILDTAGS="no_btrfs"
+          sudo -E PATH=$PATH install bin/containerd /usr/local/bin/
+        working-directory: src/github.com/containerd/containerd
+
+      - name: Install shim
+        run: |
+          cargo build --release --bin containerd-shim-runc-v2-rs
+          sudo install -D ./target/release/containerd-shim-runc-v2-rs /usr/local/bin/
+
+      - name: Integration
+        env:
+          GOPROXY: direct
+          TEST_RUNTIME: "io.containerd.runc.v2-rs"
+        run: sudo -E PATH=$PATH TESTFLAGS_PARALLEL=1 make integration TESTFLAGS_RACE=-race EXTRA_TESTFLAGS=-no-criu
+        working-directory: src/github.com/containerd/containerd
+
+      - name: Install async shim
+        run: |
+          cargo build --release --all-features --bin containerd-shim-runc-v2-rs
+          sudo install -D ./target/release/containerd-shim-runc-v2-rs /usr/local/bin/
+
+      - name: Integration for async shim
+        env:
+          GOPROXY: direct
+          TEST_RUNTIME: "io.containerd.runc.v2-rs"
+        run: sudo -E PATH=$PATH TESTFLAGS_PARALLEL=1 make integration TESTFLAGS_RACE=-race EXTRA_TESTFLAGS=-no-criu
+        working-directory: src/github.com/containerd/containerd

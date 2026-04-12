@@ -1,0 +1,58 @@
+[package]
+name = "containerd-shim-protos"
+version = "0.2.0"
+authors = ["Maksym Pavlenko <pavlenko.maksym@gmail.com>", "The containerd Authors"]
+description = "TTRPC bindings for containerd shim interfaces"
+keywords = ["containerd", "shim", "containers", "ttrpc", "client"]
+categories = ["api-bindings"]
+
+edition = "2018"
+license = "Apache-2.0"
+repository = "https://github.com/containerd/rust-extensions"
+homepage = "https://containerd.io"
+
+[dependencies]
+protobuf = "3.1"
+ttrpc = "0.7"
+async-trait = { version = "0.1.48", optional = true }
+
+[build-dependencies]
+ttrpc-codegen = "0.4"
+
+[dev-dependencies]
+ctrlc = { version = "3.0", features = ["termination"] }
+log = "0.4"
+simple_logger = { version = "4.0", default-features = false, features = ["stderr"] }
+tokio = { version = "1.18", features = ["full"] }
+
+[features]
+default = []
+async = ["ttrpc/async", "async-trait"]
+fdstore = ["ttrpc/fdstore"]
+
+[[example]]
+name = "shim-proto-server"
+path = "examples/ttrpc-server.rs"
+
+[[example]]
+name = "shim-proto-client"
+path = "examples/ttrpc-client.rs"
+
+[[example]]
+name = "shim-proto-connect"
+path = "examples/connect.rs"
+
+[[example]]
+name = "shim-proto-server-async"
+path = "examples/ttrpc-server-async.rs"
+required-features = ["async"]
+
+[[example]]
+name = "shim-proto-client-async"
+path = "examples/ttrpc-client-async.rs"
+required-features = ["async"]
+
+[[example]]
+name = "shim-proto-connect-async"
+path = "examples/connect-async.rs"
+required-features = ["async"]
