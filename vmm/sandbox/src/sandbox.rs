@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, io::ErrorKind, path::Path, sync::Arc};
+use std::{collections::HashMap, io::ErrorKind, path::Path, sync::Arc, time::Instant};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -158,6 +158,7 @@ where
 
     #[instrument(skip_all)]
     async fn create(&self, id: &str, s: SandboxOption) -> Result<()> {
+        let create_start = Instant::now();
         if self.sandboxes.read().await.get(id).is_some() {
             return Err(Error::AlreadyExist("sandbox".to_string()));
         }
@@ -204,11 +205,17 @@ where
             .write()
             .await
             .insert(id.to_string(), Arc::new(Mutex::new(sandbox)));
+        info!(
+            "nova: sandboxer create sandbox {} took {:?}",
+            id,
+            create_start.elapsed()
+        );
         Ok(())
     }
 
     #[instrument(skip_all)]
     async fn start(&self, id: &str) -> Result<()> {
+        let start = Instant::now();
         let sandbox_mutex = self.sandbox(id).await?;
         let mut sandbox = sandbox_mutex.lock().await;
         self.hooks.pre_start(&mut sandbox).await?;
@@ -234,7 +241,6 @@ where
             sandbox.destroy_network().await;
             return Err(e);
         }
-
         if let Err(e) = self.hooks.post_start(&mut sandbox).await {
             if let Err(re) = sandbox.stop(true).await {
                 warn!("roll back in sandbox post start {}", re);
@@ -243,7 +249,6 @@ where
             sandbox.destroy_network().await;
             return Err(e);
         }
-
         if let Err(e) = sandbox.dump().await {
             if let Err(re) = sandbox.stop(true).await {
                 warn!("roll back in sandbox start dump {}", re);
@@ -252,7 +257,11 @@ where
             sandbox.destroy_network().await;
             return Err(e);
         }
-
+        info!(
+            "nova: sandboxer start sandbox {} took {:?}",
+            id,
+            start.elapsed()
+        );
         Ok(())
     }
 
@@ -485,6 +494,7 @@ where
 {
     #[instrument(skip_all)]
     async fn start(&mut self) -> Result<()> {
+        let start = Instant::now();
         let pid = self.vm.start().await?;
 
         if let Err(e) = self.init_client().await {
@@ -506,6 +516,7 @@ where
         self.forward_events().await;
 
         self.status = SandboxStatus::Running(pid);
+        info!("nova: sandbox start {} took {:?}", self.id, start.elapsed());
         Ok(())
     }
 
@@ -583,6 +594,7 @@ where
 
     #[instrument(skip_all)]
     pub(crate) async fn setup_sandbox(&mut self) -> Result<()> {
+        let start = Instant::now();
         let mut req = SetupSandboxRequest::new();
 
         if let Some(client) = &*self.client.lock().await {
@@ -613,6 +625,11 @@ where
             client_setup_sandbox(client, &req).await?;
         }
 
+        info!(
+            "nova: sandbox setup rpc {} took {:?}",
+            self.id,
+            start.elapsed()
+        );
         Ok(())
     }
 
@@ -625,6 +642,7 @@ where
 
     #[instrument(skip_all)]
     async fn setup_sandbox_files(&self) -> Result<()> {
+        let start = Instant::now();
         let shared_path = self.get_sandbox_shared_path();
         create_dir_all(&shared_path)
             .await
@@ -670,6 +688,11 @@ where
             }
         }
 
+        info!(
+            "nova: sandbox setup files {} took {:?}",
+            self.id,
+            start.elapsed()
+        );
         Ok(())
     }
 
@@ -680,6 +703,7 @@ where
 
     #[instrument(skip_all)]
     pub async fn prepare_network(&mut self) -> Result<()> {
+        let start = Instant::now();
         // get vcpu for interface queue, at least one vcpu
         let mut vcpu = 1;
         if let Some(resources) = get_resources(&self.data) {
@@ -697,6 +721,11 @@ where
         };
         let network = Network::new(network_config).await?;
         network.attach_to(self).await?;
+        info!(
+            "nova: sandbox prepare network {} took {:?}",
+            self.id,
+            start.elapsed()
+        );
         Ok(())
     }
 
@@ -711,6 +740,7 @@ where
 
     #[instrument(skip_all)]
     pub async fn add_to_cgroup(&self) -> Result<()> {
+        let start = Instant::now();
         // Currently only support cgroup V1, cgroup V2 is not supported now
         if !cgroups_rs::hierarchies::is_cgroup2_unified_mode() {
             // add vmm process into sandbox cgroup
@@ -733,6 +763,11 @@ where
                 )));
             }
         }
+        info!(
+            "nova: sandbox add to cgroup {} took {:?}",
+            self.id,
+            start.elapsed()
+        );
         Ok(())
     }
 

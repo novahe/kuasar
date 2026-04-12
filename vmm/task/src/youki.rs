@@ -22,6 +22,7 @@ use std::{
     },
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
 use async_trait::async_trait;
@@ -48,7 +49,7 @@ use libcontainer::{
     signal::Signal,
     syscall::syscall::SyscallType,
 };
-use log::{debug, warn};
+use log::{debug, info, warn};
 use nix::{sys::signal::kill, unistd::Pid};
 use oci_spec::runtime::{LinuxResources, Process, Spec};
 use runc::io::{IOOption, Io, NullIo};
@@ -89,6 +90,7 @@ impl ContainerFactory<YoukiContainer> for YoukiFactory {
         _ns: &str,
         req: &CreateTaskRequest,
     ) -> containerd_shim::Result<YoukiContainer> {
+        let start = Instant::now();
         rescan_pci_bus().await?;
         let bundle = format!("{}/{}", KUASAR_STATE_DIR, req.id);
         let spec: Spec = read_spec(&bundle).await?;
@@ -135,6 +137,11 @@ impl ContainerFactory<YoukiContainer> for YoukiFactory {
             },
             processes: Default::default(),
         };
+        info!(
+            "nova: task create container {} took {:?}",
+            req.id(),
+            start.elapsed()
+        );
         Ok(container)
     }
 
@@ -271,12 +278,18 @@ pub struct YoukiInitLifecycle {
 #[async_trait]
 impl ProcessLifecycle<InitProcess> for YoukiInitLifecycle {
     async fn start(&self, p: &mut InitProcess) -> containerd_shim::Result<()> {
+        let start = Instant::now();
         p.lifecycle
             .youki_container
             .lock()
             .await
             .start()
             .map_err(other_error!(e, "failed to start container "))?;
+        info!(
+            "nova: task start container {} took {:?}",
+            p.id,
+            start.elapsed()
+        );
         p.state = Status::RUNNING;
         Ok(())
     }

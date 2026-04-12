@@ -14,7 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, os::fd::AsRawFd, path::Path, process::exit, time::Duration};
+use std::{
+    collections::HashMap,
+    os::fd::AsRawFd,
+    path::Path,
+    process::exit,
+    time::{Duration, Instant},
+};
 
 use containerd_sandbox::{cri::api::v1::NamespaceMode, PodSandboxConfig};
 use containerd_shim::{
@@ -23,7 +29,7 @@ use containerd_shim::{
     util::{mkdir, IntoOption},
     Result,
 };
-use log::{debug, warn};
+use log::{debug, info, warn};
 use nix::{
     sched::{unshare, CloneFlags},
     unistd::{fork, getpid, pause, pipe, ForkResult, Pid},
@@ -364,6 +370,7 @@ async fn setup_persistent_ns(ns_types: Vec<String>) -> Result<()> {
 }
 
 pub async fn setup_sandbox(config: &PodSandboxConfig) -> Result<()> {
+    let start = Instant::now();
     // Set sysctl
     if let Some(linux) = &config.linux {
         write_sysctl(linux.clone().sysctls).await?
@@ -372,6 +379,7 @@ pub async fn setup_sandbox(config: &PodSandboxConfig) -> Result<()> {
     // Set Network NS
     setup_sandbox_ns(config).await?;
 
+    info!("nova: task setup sandbox took {:?}", start.elapsed());
     Ok(())
 }
 

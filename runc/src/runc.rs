@@ -26,6 +26,7 @@ use std::{
     path::{Path, PathBuf},
     process::ExitStatus,
     sync::Arc,
+    time::Instant,
 };
 
 use async_trait::async_trait;
@@ -54,7 +55,7 @@ use containerd_shim::{
     },
     Console, Error, ExitSignal, Result,
 };
-use log::{debug, error};
+use log::{debug, error, info};
 use nix::{sys::signal::kill, unistd::Pid};
 use oci_spec::runtime::{LinuxResources, Process};
 use runc::{Command, Runc, Spawner};
@@ -117,6 +118,7 @@ impl ContainerFactory<RuncContainer> for RuncFactory {
         ns: &str,
         req: &CreateTaskRequest,
     ) -> containerd_shim::Result<RuncContainer> {
+        let start = Instant::now();
         let bundle = req.bundle();
         let mut opts = Options::new();
         if let Some(any) = req.options.as_ref() {
@@ -177,6 +179,11 @@ impl ContainerFactory<RuncContainer> for RuncFactory {
             },
             processes: Default::default(),
         };
+        info!(
+            "nova: task create container {} took {:?}",
+            id,
+            start.elapsed()
+        );
         Ok(container)
     }
 
@@ -309,10 +316,16 @@ pub struct RuncInitLifecycle {
 #[async_trait]
 impl ProcessLifecycle<InitProcess> for RuncInitLifecycle {
     async fn start(&self, p: &mut InitProcess) -> containerd_shim::Result<()> {
+        let start = Instant::now();
         self.runtime
             .start(p.id.as_str())
             .await
             .map_err(other_error!(e, "failed start"))?;
+        info!(
+            "nova: task start container {} took {:?}",
+            p.id,
+            start.elapsed()
+        );
         p.state = Status::RUNNING;
         Ok(())
     }
@@ -429,6 +442,7 @@ pub struct RuncExecLifecycle {
 #[async_trait]
 impl ProcessLifecycle<ExecProcess> for RuncExecLifecycle {
     async fn start(&self, p: &mut ExecProcess) -> containerd_shim::Result<()> {
+        let start = Instant::now();
         let pid_path = Path::new(self.bundle.as_str()).join(format!("{}.pid", &p.id));
         let mut exec_opts = runc::options::ExecOpts {
             io: None,
@@ -459,6 +473,11 @@ impl ProcessLifecycle<ExecProcess> for RuncExecLifecycle {
         copy_io_or_console(p, socket, pio, p.lifecycle.exit_signal.clone()).await?;
         let pid = read_file_to_str(pid_path).await?.parse::<i32>()?;
         p.pid = pid;
+        info!(
+            "nova: task start exec {} took {:?}",
+            p.id,
+            start.elapsed()
+        );
         p.state = Status::RUNNING;
         Ok(())
     }
