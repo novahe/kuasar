@@ -216,19 +216,22 @@ where
         let cgroup_parent_path = get_sandbox_cgroup_parent_path(&s.sandbox)
             .unwrap_or(DEFAULT_CGROUP_PARENT_PATH.to_string());
         // Currently only support cgroup V1, cgroup V2 is not supported now
-        if !cgroups_rs::hierarchies::is_cgroup2_unified_mode() {
-            // Create sandbox's cgroup and apply sandbox's resources limit
-            let create_and_update_sandbox_cgroup = (|| {
-                sandbox_cgroups =
-                    SandboxCgroup::create_sandbox_cgroups(&cgroup_parent_path, &s.sandbox.id)?;
-                sandbox_cgroups.update_res_for_sandbox_cgroups(&s.sandbox)?;
-                Ok(())
-            })();
-            // If create and update sandbox cgroup failed, do rollback operation
-            if let Err(e) = create_and_update_sandbox_cgroup {
-                let _ = sandbox_cgroups.remove_sandbox_cgroups();
-                return Err(e);
-            }
+        let is_v2 = tokio::task::spawn_blocking(cgroups_rs::hierarchies::is_cgroup2_unified_mode)
+            .await
+            .map_err(|e| Error::Other(anyhow!("spawn_blocking failed: {}", e)))?;
+
+        if !is_v2 {
+            let sandbox_data = s.sandbox.clone();
+            sandbox_cgroups = tokio::task::spawn_blocking(move || -> Result<SandboxCgroup> {
+                let cg = SandboxCgroup::create_sandbox_cgroups(&cgroup_parent_path, &sandbox_data.id)?;
+                if let Err(e) = cg.update_res_for_sandbox_cgroups(&sandbox_data) {
+                    let _ = cg.remove_sandbox_cgroups();
+                    return Err(Error::Other(e));
+                }
+                Ok(cg)
+            })
+            .await
+            .map_err(|e| Error::Other(anyhow!("spawn_blocking failed: {}", e)))??;
         }
         let vm = self.factory.create_vm(id, &s).await?;
         let mut sandbox = KuasarSandbox {
@@ -363,9 +366,16 @@ where
             sb.stop(true).await?;
 
             // Currently only support cgroup V1, cgroup V2 is not supported now
-            if !cgroups_rs::hierarchies::is_cgroup2_unified_mode() {
+            let is_v2 = tokio::task::spawn_blocking(cgroups_rs::hierarchies::is_cgroup2_unified_mode)
+                .await
+                .map_err(|e| Error::Other(anyhow!("spawn_blocking failed: {}", e)))?;
+
+            if !is_v2 {
                 // remove the sandbox cgroups
-                sb.sandbox_cgroups.remove_sandbox_cgroups()?;
+                let cg = std::mem::take(&mut sb.sandbox_cgroups);
+                tokio::task::spawn_blocking(move || cg.remove_sandbox_cgroups())
+                    .await
+                    .map_err(|e| Error::Other(anyhow!("spawn_blocking failed: {}", e)))??;
             }
 
             cleanup_mounts(&sb.base_dir).await?;
@@ -531,8 +541,13 @@ where
             sb.forward_events().await;
         }
         // recover the sandbox_cgroups in the sandbox object
-        sb.sandbox_cgroups =
-            SandboxCgroup::create_sandbox_cgroups(&sb.sandbox_cgroups.cgroup_parent_path, &sb.id)?;
+        let sb_id = sb.id.clone();
+        let cgroup_parent_path = sb.sandbox_cgroups.cgroup_parent_path.clone();
+        sb.sandbox_cgroups = tokio::task::spawn_blocking(move || {
+            SandboxCgroup::create_sandbox_cgroups(&cgroup_parent_path, &sb_id)
+        })
+        .await
+        .map_err(|e| Error::Other(anyhow!("spawn_blocking failed: {}", e)))??;
 
         info!(
             "recover sandbox {} takes {}ms",
@@ -820,10 +835,14 @@ where
     }
 
     #[instrument(skip_all)]
-    pub async fn add_to_cgroup(&self) -> Result<()> {
+    pub async fn add_to_cgroup(&mut self) -> Result<()> {
         let start = Instant::now();
         // Currently only support cgroup V1, cgroup V2 is not supported now
-        if !cgroups_rs::hierarchies::is_cgroup2_unified_mode() {
+        let is_v2 = tokio::task::spawn_blocking(cgroups_rs::hierarchies::is_cgroup2_unified_mode)
+            .await
+            .map_err(|e| Error::Other(anyhow!("spawn_blocking failed: {}", e)))?;
+
+        if !is_v2 {
             // add vmm process into sandbox cgroup
             if let SandboxStatus::Running(vmm_pid) = self.status {
                 let vcpu_threads = self.vm.vcpus().await?;
@@ -831,13 +850,19 @@ where
                     "vmm process pid: {}, vcpu threads pid: {:?}",
                     vmm_pid, vcpu_threads
                 );
-                self.sandbox_cgroups
-                    .add_process_into_sandbox_cgroups(vmm_pid, Some(vcpu_threads))?;
-                // move all vmm-related process into sandbox cgroup
-                for pid in self.vm.pids().affiliated_pids {
-                    self.sandbox_cgroups
-                        .add_process_into_sandbox_cgroups(pid, None)?;
-                }
+                let mut cg = std::mem::take(&mut self.sandbox_cgroups);
+                let affiliated_pids = self.vm.pids().affiliated_pids.clone();
+
+                self.sandbox_cgroups = tokio::task::spawn_blocking(move || -> Result<SandboxCgroup> {
+                    cg.add_process_into_sandbox_cgroups(vmm_pid, Some(vcpu_threads))?;
+                    // move all vmm-related process into sandbox cgroup
+                    for pid in affiliated_pids {
+                        cg.add_process_into_sandbox_cgroups(pid, None)?;
+                    }
+                    Ok(cg)
+                })
+                .await
+                .map_err(|e| Error::Other(anyhow!("spawn_blocking failed: {}", e)))??;
             } else {
                 return Err(Error::Other(anyhow!(
                     "sandbox status is not Running after started!"

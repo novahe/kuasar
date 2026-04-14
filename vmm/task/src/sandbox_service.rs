@@ -21,20 +21,22 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use async_trait::async_trait;
-use containerd_sandbox::PodSandboxConfig;
-use containerd_shim::{
-    error::Result,
-    protos::{protobuf::MessageDyn, topics::TASK_OOM_EVENT_TOPIC},
-    util::convert_to_any,
-    Error, TtrpcContext, TtrpcResult,
-};
-use log::debug;
 use nix::{
     sys::time::{TimeSpec, TimeValLike},
     time::{clock_gettime, clock_settime, ClockId},
 };
-use tokio::sync::{mpsc::Receiver, Mutex};
+
+use async_trait::async_trait;
+use containerd_sandbox::PodSandboxConfig;
+use containerd_shim::{
+    error::{Error, Result},
+    other,
+    protos::{protobuf::MessageDyn, topics::TASK_OOM_EVENT_TOPIC},
+    util::convert_to_any,
+    TtrpcContext, TtrpcResult,
+};
+use log::debug;
+use tokio::sync::{mpsc::Receiver, watch, Mutex};
 use vmm_common::{
     api,
     api::{
@@ -47,23 +49,48 @@ use vmm_common::{
     },
 };
 
-use crate::{netlink::Handle, sandbox::setup_sandbox, util::spawn_and_wait, NAMESPACE};
+use crate::{
+    netlink::Handle, sandbox::setup_sandbox, util::spawn_and_wait, NAMESPACE, SharedInitState,
+};
 
 pub struct SandboxService {
     pub namespace: String,
     pub handle: Arc<Mutex<Handle>>,
     #[allow(clippy::type_complexity)]
     pub rx: Arc<Mutex<Receiver<(String, Box<dyn MessageDyn>)>>>,
+    pub shared_init_ready: watch::Receiver<SharedInitState>,
 }
 
 impl SandboxService {
-    pub fn new(rx: Receiver<(String, Box<dyn MessageDyn>)>) -> Result<Self> {
+    pub fn new(
+        rx: Receiver<(String, Box<dyn MessageDyn>)>,
+        shared_init_ready: watch::Receiver<SharedInitState>,
+    ) -> Result<Self> {
         let handle = Handle::new()?;
         Ok(Self {
             namespace: NAMESPACE.to_string(),
             handle: Arc::new(Mutex::new(handle)),
             rx: Arc::new(Mutex::new(rx)),
+            shared_init_ready,
         })
+    }
+
+    async fn wait_for_ready(&self) -> Result<()> {
+        let mut rx = self.shared_init_ready.clone();
+        loop {
+            let state = rx.borrow().clone();
+            match state {
+                SharedInitState::Initializing => {
+                    rx.changed().await.map_err(|e| {
+                        other!("failed to wait for shared init: {}", e)
+                    })?;
+                }
+                SharedInitState::Ready => return Ok(()),
+                SharedInitState::Failed(e) => {
+                    return Err(other!("shared init failed: {}", e));
+                }
+            }
+        }
     }
 
     pub(crate) async fn handle_localhost(&self) -> Result<()> {
@@ -100,6 +127,7 @@ impl api::sandbox_ttrpc::SandboxService for SandboxService {
         _ctx: &TtrpcContext,
         req: SetupSandboxRequest,
     ) -> TtrpcResult<Empty> {
+        self.wait_for_ready().await?;
         match req.config.type_url.as_str() {
             "PodSandboxConfig" => {
                 let config =

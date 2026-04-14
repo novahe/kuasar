@@ -48,6 +48,7 @@ use vmm_common::{
     trace, ETC_RESOLV, IPC_NAMESPACE, KUASAR_STATE_DIR, PID_NAMESPACE, RESOLV_FILENAME,
     UTS_NAMESPACE,
 };
+use tokio::sync::watch;
 
 use crate::{
     config::TaskConfig,
@@ -76,6 +77,13 @@ mod vsock;
 mod youki;
 
 const NAMESPACE: &str = "k8s.io";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SharedInitState {
+    Initializing,
+    Ready,
+    Failed(String),
+}
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct StaticMount {
@@ -148,15 +156,32 @@ lazy_static! {
     ]);
 }
 
-async fn initialize() -> anyhow::Result<TaskConfig> {
+async fn pre_initialize() -> anyhow::Result<TaskConfig> {
     early_init_call().await?;
 
     let config = TaskConfig::new().await?;
     trace::set_enabled(config.enable_tracing);
     init_logger(&config.log_level)?;
 
-    info!("Task server start with config: {:?}", config);
+    info!("Task server pre-initialization complete with config: {:?}", config);
+    Ok(config)
+}
 
+async fn shared_init(tx: watch::Sender<SharedInitState>, config: TaskConfig) {
+    info!("Starting shared initialization (sharefs, etc.)");
+    match do_shared_init(config).await {
+        Ok(_) => {
+            info!("Shared initialization successfully completed");
+            let _ = tx.send(SharedInitState::Ready);
+        }
+        Err(e) => {
+            error!("Shared initialization failed: {:?}", e);
+            let _ = tx.send(SharedInitState::Failed(e.to_string()));
+        }
+    }
+}
+
+async fn do_shared_init(config: TaskConfig) -> anyhow::Result<()> {
     match &*config.sharefs_type {
         "9p" => {
             mount_static_mounts(SHAREFS_9P_MOUNTS.clone()).await?;
@@ -168,16 +193,9 @@ async fn initialize() -> anyhow::Result<TaskConfig> {
             warn!("sharefs_type should be either 9p or virtiofs");
         }
     }
-    if config.debug {
-        debug!("listen vsock port 1025 for debug console");
-        if let Err(e) = listen_debug_console("vsock://-1:1025", &config.debug_shell).await {
-            error!("failed to listen debug console port, {:?}", e);
-        }
-    }
 
     late_init_call().await?;
-
-    Ok(config)
+    Ok(())
 }
 
 fn init_logger(log_level: &str) -> anyhow::Result<()> {
@@ -203,15 +221,19 @@ fn init_logger(log_level: &str) -> anyhow::Result<()> {
 #[tokio::main]
 async fn main() {
     vmm_common::panic::set_panic_hook();
-    let config = match initialize().await {
+    let config = match pre_initialize().await {
         Ok(c) => c,
         Err(e) => {
-            error!("failed to do init call:: {:?}", e);
+            error!("failed to do pre-init call:: {:?}", e);
             exit(-1);
         }
     };
+
+    let (tx, rx) = watch::channel(SharedInitState::Initializing);
+
     // Keep server alive in main function
-    let mut server = match create_ttrpc_server().await {
+    // Start TTRPC server as early as possible so host can reach the check() endpoint
+    let mut server = match create_ttrpc_server(rx).await {
         Ok(s) => s,
         Err(e) => {
             error!("failed to create ttrpc server: {:?}", e);
@@ -221,6 +243,21 @@ async fn main() {
     if let Err(e) = server.start().await {
         error!("failed to start ttrpc server: {:?}", e);
         exit(-1);
+    }
+
+    let config_clone = config.clone();
+    tokio::spawn(async move {
+        shared_init(tx, config_clone).await;
+    });
+
+    if config.debug {
+        let debug_shell = config.debug_shell.clone();
+        tokio::spawn(async move {
+            debug!("listen vsock port 1025 for debug console");
+            if let Err(e) = listen_debug_console("vsock://-1:1025", &debug_shell).await {
+                error!("failed to listen debug console port, {:?}", e);
+            }
+        });
     }
 
     let signals = match Signals::new([
@@ -424,12 +461,14 @@ async fn mount_static_mounts(mounts: Vec<StaticMount>) -> Result<()> {
 
 // create_ttrpc_server will create all the ttrpc service and register them to a server that
 // bind to vsock 1024 port.
-async fn create_ttrpc_server() -> anyhow::Result<Server> {
-    let (tx, rx) = channel(128);
-    let task = create_task_service(tx).await?;
+async fn create_ttrpc_server(
+    rx: watch::Receiver<SharedInitState>,
+) -> anyhow::Result<Server> {
+    let (tx, m_rx) = channel(128);
+    let task = create_task_service(tx, rx.clone()).await?;
     let task_service = create_task(Arc::new(Box::new(task)));
 
-    let sandbox = SandboxService::new(rx)?;
+    let sandbox = SandboxService::new(m_rx, rx)?;
     sandbox.handle_localhost().await?;
     let sandbox_service = create_sandbox_service(Arc::new(Box::new(sandbox)));
 

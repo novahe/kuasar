@@ -49,10 +49,11 @@ use tokio::{
     fs::{remove_file, File},
     io::{AsyncBufReadExt, AsyncSeekExt, BufReader},
     process::{ChildStderr, ChildStdout, Command},
-    sync::Mutex,
+    sync::{watch, Mutex},
 };
 use tracing::instrument;
 use vmm_common::{
+    api::shim::oci::Options,
     mount::get_mount_type,
     storage::{Storage, ANNOTATION_KEY_STORAGE},
     KUASAR_STATE_DIR,
@@ -63,6 +64,7 @@ use crate::{
     io::{convert_stdio, copy_io_or_console, create_io},
     sandbox::SandboxResources,
     util::{read_io, read_std, read_storages, PidMonitorGuard},
+    SharedInitState,
 };
 
 pub const INIT_PID_FILE: &str = "init.pid";
@@ -75,6 +77,7 @@ pub type KuasarContainer = ContainerTemplate<InitProcess, ExecProcess, KuasarExe
 #[derive(Clone)]
 pub(crate) struct KuasarFactory {
     sandbox: Arc<Mutex<SandboxResources>>,
+    shared_init_ready: watch::Receiver<SharedInitState>,
 }
 
 pub struct KuasarExecFactory {
@@ -115,8 +118,8 @@ impl ContainerFactory<KuasarContainer> for KuasarFactory {
         ns: &str,
         req: &CreateTaskRequest,
     ) -> containerd_shim::Result<KuasarContainer> {
+        self.wait_for_ready().await?;
         let start = Instant::now();
-        rescan_pci_bus().await?;
         let bundle = format!("{}/{}", KUASAR_STATE_DIR, req.id);
         let spec: Spec = read_spec(&bundle).await?;
         let annotations = spec.annotations().clone().unwrap_or_default();
@@ -125,6 +128,18 @@ impl ContainerFactory<KuasarContainer> for KuasarFactory {
         } else {
             read_storages(&bundle, req.id()).await?
         };
+
+        let mut needs_rescan = false;
+        for s in &storages {
+            if s.source.starts_with("/dev/") && !tokio::fs::try_exists(&s.source).await.unwrap_or(true) {
+                needs_rescan = true;
+                break;
+            }
+        }
+        if needs_rescan {
+            rescan_pci_bus().await.unwrap_or_default();
+        }
+
         self.sandbox
             .lock()
             .await
@@ -196,8 +211,32 @@ impl ContainerFactory<KuasarContainer> for KuasarFactory {
 }
 
 impl KuasarFactory {
-    pub fn new(sandbox: Arc<Mutex<SandboxResources>>) -> Self {
-        Self { sandbox }
+    pub fn new(
+        sandbox: Arc<Mutex<SandboxResources>>,
+        shared_init_ready: watch::Receiver<SharedInitState>,
+    ) -> Self {
+        Self {
+            sandbox,
+            shared_init_ready,
+        }
+    }
+
+    async fn wait_for_ready(&self) -> containerd_shim::Result<()> {
+        let mut rx = self.shared_init_ready.clone();
+        loop {
+            let state = rx.borrow().clone();
+            match state {
+                SharedInitState::Initializing => {
+                    rx.changed().await.map_err(|e| {
+                        other!("failed to wait for shared init: {}", e)
+                    })?;
+                }
+                SharedInitState::Ready => return Ok(()),
+                SharedInitState::Failed(e) => {
+                    return Err(other!("shared init failed: {}", e));
+                }
+            }
+        }
     }
 
     #[instrument(skip_all)]
@@ -485,7 +524,6 @@ impl ProcessLifecycle<ExecProcess> for KuasarExecLifecycle {
     #[instrument(skip_all)]
     async fn start(&self, p: &mut ExecProcess) -> containerd_shim::Result<()> {
         let start = Instant::now();
-        rescan_pci_bus().await?;
         let bundle = self.bundle.to_string();
         let pid_path = Path::new(&bundle).join(format!("{}.pid", &p.id));
         let mut exec_opts = runc::options::ExecOpts {

@@ -29,7 +29,8 @@ use containerd_shim::{
 };
 use log::{debug, error};
 use oci_spec::runtime::{LinuxNamespaceType, Spec};
-use tokio::sync::{mpsc::Sender, Mutex};
+use tokio::sync::{mpsc::Sender, watch, Mutex};
+use crate::{SharedInitState};
 
 #[cfg(not(feature = "youki"))]
 use crate::container::{KuasarContainer, KuasarFactory};
@@ -49,10 +50,11 @@ type RealContainer = YoukiContainer;
 
 pub(crate) async fn create_task_service(
     tx: Sender<(String, Box<dyn MessageDyn>)>,
+    shared_init_ready: watch::Receiver<SharedInitState>,
 ) -> anyhow::Result<TaskService<Factory, RealContainer>> {
     let sandbox = Arc::new(Mutex::new(SandboxResources::new().await));
     let task = TaskService {
-        factory: Factory::new(sandbox),
+        factory: Factory::new(sandbox, shared_init_ready),
         containers: Arc::new(Default::default()),
         namespace: NAMESPACE.to_string(),
         exit: Arc::new(Default::default()),

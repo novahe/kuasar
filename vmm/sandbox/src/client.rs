@@ -17,7 +17,7 @@ limitations under the License.
 use std::{
     os::fd::{IntoRawFd, RawFd},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::anyhow;
@@ -29,7 +29,7 @@ use containerd_shim::{
     protos::{api::Envelope, shim::events, shim_async::Events},
     publisher::RemotePublisher,
 };
-use log::{debug, error};
+use log::{debug, error, info};
 use nix::{
     sys::{
         socket::{connect, socket, AddressFamily, SockFlag, SockType, UnixAddr, VsockAddr},
@@ -270,23 +270,33 @@ pub fn unix_sock(r#abstract: bool, socket_path: &str) -> Result<UnixAddr> {
 }
 
 pub(crate) async fn client_check(client: &SandboxServiceClient, t_secs: u64) -> Result<()> {
-    // the initial timeout is 1, and will grow exponentially
-    let retry_timeout = 1;
+    let start = Instant::now();
+    // the initial interval is 10, and will grow exponentially
+    let retry_interval = 10;
 
-    let res_fut = do_check_agent(client, retry_timeout);
+    // Initial fixed wait for VM boot
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let res_fut = do_check_agent(client, retry_interval);
     timeout(Duration::from_secs(t_secs), res_fut)
         .await
         .map_err(|_| anyhow!("{}s timeout checking", t_secs))?;
+    info!(
+        "nova: agent check successful in {:?}",
+        start.elapsed()
+    );
     Ok(())
 }
 
-async fn do_check_agent(client: &SandboxServiceClient, timeout: u64) {
+async fn do_check_agent(client: &SandboxServiceClient, mut sleep_ms: u64) {
     let req = CheckRequest::new();
-    let duration = Duration::from_secs(timeout).as_nanos() as i64;
+    let duration = Duration::from_secs(1).as_nanos() as i64;
     loop {
         if client.check(with_timeout(duration), &req).await.is_ok() {
             return;
         };
+        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+        sleep_ms = std::cmp::min(sleep_ms * 2, 100);
     }
 }
 

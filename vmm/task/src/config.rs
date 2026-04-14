@@ -39,7 +39,7 @@ macro_rules! parse_cmdline {
     };
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TaskConfig {
     pub(crate) sharefs_type: String,
     pub(crate) log_level: String,

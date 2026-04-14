@@ -56,7 +56,7 @@ use runc::io::{IOOption, Io, NullIo};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     process::Command,
-    sync::Mutex,
+    sync::{watch, Mutex},
     task::spawn_blocking,
 };
 use vmm_common::{
@@ -69,6 +69,7 @@ use crate::{
     io::{convert_stdio, copy_io_or_console, ProcessIO},
     sandbox::SandboxResources,
     util::{read_io, read_storages},
+    SharedInitState,
 };
 
 pub type ExecProcess = ProcessTemplate<YoukiExecLifecycle>;
@@ -81,6 +82,7 @@ pub const YOUKI_DIR: &str = "/run/kuasar/youki";
 #[derive(Clone)]
 pub(crate) struct YoukiFactory {
     sandbox: Arc<Mutex<SandboxResources>>,
+    shared_init_ready: watch::Receiver<SharedInitState>,
 }
 
 #[async_trait]
@@ -90,8 +92,8 @@ impl ContainerFactory<YoukiContainer> for YoukiFactory {
         _ns: &str,
         req: &CreateTaskRequest,
     ) -> containerd_shim::Result<YoukiContainer> {
+        self.wait_for_ready().await?;
         let start = Instant::now();
-        rescan_pci_bus().await?;
         let bundle = format!("{}/{}", KUASAR_STATE_DIR, req.id);
         let spec: Spec = read_spec(&bundle).await?;
         let annotations = spec.annotations().clone().unwrap_or_default();
@@ -100,6 +102,18 @@ impl ContainerFactory<YoukiContainer> for YoukiFactory {
         } else {
             read_storages(&bundle, req.id()).await?
         };
+
+        let mut needs_rescan = false;
+        for s in &storages {
+            if s.source.starts_with("/dev/") && !tokio::fs::try_exists(&s.source).await.unwrap_or(true) {
+                needs_rescan = true;
+                break;
+            }
+        }
+        if needs_rescan {
+            rescan_pci_bus().await.unwrap_or_default();
+        }
+
         self.sandbox
             .lock()
             .await
@@ -152,8 +166,32 @@ impl ContainerFactory<YoukiContainer> for YoukiFactory {
 }
 
 impl YoukiFactory {
-    pub fn new(sandbox: Arc<Mutex<SandboxResources>>) -> Self {
-        Self { sandbox }
+    pub fn new(
+        sandbox: Arc<Mutex<SandboxResources>>,
+        shared_init_ready: watch::Receiver<SharedInitState>,
+    ) -> Self {
+        Self {
+            sandbox,
+            shared_init_ready,
+        }
+    }
+
+    async fn wait_for_ready(&self) -> containerd_shim::Result<()> {
+        let mut rx = self.shared_init_ready.clone();
+        loop {
+            let state = rx.borrow().clone();
+            match state {
+                SharedInitState::Initializing => {
+                    rx.changed().await.map_err(|e| {
+                        other!("failed to wait for shared init: {}", e)
+                    })?;
+                }
+                SharedInitState::Ready => return Ok(()),
+                SharedInitState::Failed(e) => {
+                    return Err(other!("shared init failed: {}", e));
+                }
+            }
+        }
     }
 
     async fn do_create(
@@ -395,7 +433,6 @@ pub struct YoukiExecLifecycle {
 #[async_trait]
 impl ProcessLifecycle<ExecProcess> for YoukiExecLifecycle {
     async fn start(&self, p: &mut ExecProcess) -> containerd_shim::Result<()> {
-        rescan_pci_bus().await?;
         let (socket, pio, container_io) = if p.stdio.terminal {
             let s = ConsoleSocket::new().await?;
             (Some(s), None, None)
