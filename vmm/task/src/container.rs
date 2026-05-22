@@ -54,6 +54,7 @@ use tokio::{
 use tracing::instrument;
 use vmm_common::{
     mount::get_mount_type,
+    nova_trace,
     storage::{Storage, ANNOTATION_KEY_STORAGE},
     KUASAR_STATE_DIR,
 };
@@ -115,7 +116,7 @@ impl ContainerFactory<KuasarContainer> for KuasarFactory {
         ns: &str,
         req: &CreateTaskRequest,
     ) -> containerd_shim::Result<KuasarContainer> {
-        let start = Instant::now();
+        nova_trace!("task create container", req.id());
         rescan_pci_bus().await?;
         let bundle = format!("{}/{}", KUASAR_STATE_DIR, req.id);
         let spec: Spec = read_spec(&bundle).await?;
@@ -180,11 +181,6 @@ impl ContainerFactory<KuasarContainer> for KuasarFactory {
             },
             processes: Default::default(),
         };
-        info!(
-            "nova: task create container {} took {:?}",
-            req.id(),
-            start.elapsed()
-        );
         Ok(container)
     }
 
@@ -354,15 +350,10 @@ impl ProcessFactory<ExecProcess> for KuasarExecFactory {
 impl ProcessLifecycle<InitProcess> for KuasarInitLifecycle {
     #[instrument(skip_all)]
     async fn start(&self, p: &mut InitProcess) -> containerd_shim::Result<()> {
-        let start = Instant::now();
         if let Err(e) = self.runtime.start(p.id.as_str()).await {
             return Err(runtime_error(&p.lifecycle.bundle, e, "OCI runtime start failed").await);
         }
-        info!(
-            "nova: task start container {} took {:?}",
-            p.id,
-            start.elapsed()
-        );
+        nova_trace!("task start container", p.id);
         p.state = Status::RUNNING;
         Ok(())
     }
@@ -484,7 +475,6 @@ impl KuasarInitLifecycle {
 impl ProcessLifecycle<ExecProcess> for KuasarExecLifecycle {
     #[instrument(skip_all)]
     async fn start(&self, p: &mut ExecProcess) -> containerd_shim::Result<()> {
-        let start = Instant::now();
         rescan_pci_bus().await?;
         let bundle = self.bundle.to_string();
         let pid_path = Path::new(&bundle).join(format!("{}.pid", &p.id));
@@ -517,11 +507,7 @@ impl ProcessLifecycle<ExecProcess> for KuasarExecLifecycle {
         copy_io_or_console(p, socket, pio, p.lifecycle.exit_signal.clone()).await?;
         let pid = read_file_to_str(pid_path).await?.parse::<i32>()?;
         p.pid = pid;
-        info!(
-            "nova: task start exec {} took {:?}",
-            p.id,
-            start.elapsed()
-        );
+        nova_trace!("task start exec", p.id);
         p.state = Status::RUNNING;
         Ok(())
     }

@@ -45,7 +45,7 @@ use tracing_subscriber::{
 use vmm_common::{
     api::{sandbox_ttrpc::create_sandbox_service, streaming_ttrpc::create_streaming},
     mount::mount,
-    trace, ETC_RESOLV, IPC_NAMESPACE, KUASAR_STATE_DIR, PID_NAMESPACE, RESOLV_FILENAME,
+    nova_trace, trace, ETC_RESOLV, IPC_NAMESPACE, KUASAR_STATE_DIR, PID_NAMESPACE, RESOLV_FILENAME,
     UTS_NAMESPACE,
 };
 
@@ -159,9 +159,11 @@ async fn initialize() -> anyhow::Result<TaskConfig> {
 
     match &*config.sharefs_type {
         "9p" => {
+            nova_trace!("task shared_init mount 9p sharefs");
             mount_static_mounts(SHAREFS_9P_MOUNTS.clone()).await?;
         }
         "virtiofs" => {
+            nova_trace!("task shared_init mount virtiofs sharefs");
             mount_static_mounts(SHAREFS_VIRTIOFS_MOUNTS.clone()).await?;
         }
         _ => {
@@ -175,15 +177,20 @@ async fn initialize() -> anyhow::Result<TaskConfig> {
         }
     }
 
-    late_init_call().await?;
+    {
+        nova_trace!("task shared_init late_init_call");
+        late_init_call().await?;
+    }
 
+    nova_trace!("task server pre-initialization complete");
     Ok(config)
 }
 
 fn init_logger(log_level: &str) -> anyhow::Result<()> {
     let env_filter = EnvFilter::from_default_env()
         .add_directive(format!("containerd_shim={}", log_level).parse()?)
-        .add_directive(format!("vmm_task={}", log_level).parse()?);
+        .add_directive(format!("vmm_task={}", log_level).parse()?)
+        .add_directive(format!("vmm_common={}", log_level).parse()?);
 
     let mut layers = vec![tracing_subscriber::fmt::layer().boxed()];
     // TODO: shutdown tracer provider when is_enabled is false
@@ -210,6 +217,7 @@ async fn main() {
             exit(-1);
         }
     };
+
     // Keep server alive in main function
     let mut server = match create_ttrpc_server().await {
         Ok(s) => s,
@@ -222,6 +230,7 @@ async fn main() {
         error!("failed to start ttrpc server: {:?}", e);
         exit(-1);
     }
+    nova_trace!("task ttrpc server started");
 
     let signals = match Signals::new([
         libc::SIGTERM,
@@ -357,20 +366,26 @@ lazy_static! {
 }
 
 async fn init_vm_rootfs() -> Result<()> {
-    let mounts = VM_ROOTFS_MOUNTS.clone();
-    mount_static_mounts(mounts).await?;
-    // has to mount /proc before find cgroup mounts
-    let cgroup_mounts = get_cgroup_mounts(PROC_CGROUPS, false).await?;
-    mount_static_mounts(cgroup_mounts).await?;
+    {
+        nova_trace!("task init_vm_rootfs mount core fs");
+        let mounts = VM_ROOTFS_MOUNTS.clone();
+        mount_static_mounts(mounts).await?;
+        // has to mount /proc before find cgroup mounts
+        let cgroup_mounts = get_cgroup_mounts(PROC_CGROUPS, false).await?;
+        mount_static_mounts(cgroup_mounts).await?;
+    }
 
-    // Set default sysctl
-    for sysctl in DEFAULT_SYSCTL.iter() {
-        if !Path::new(&sysctl.0).exists() {
-            continue;
+    {
+        nova_trace!("task init_vm_rootfs write sysctls");
+        // Set default sysctl
+        for sysctl in DEFAULT_SYSCTL.iter() {
+            if !Path::new(&sysctl.0).exists() {
+                continue;
+            }
+            tokio::fs::write(&sysctl.0, &sysctl.1)
+                .await
+                .map_err(io_error!(e, "failed to write kernel parameter "))?;
         }
-        tokio::fs::write(&sysctl.0, &sysctl.1)
-            .await
-            .map_err(io_error!(e, "failed to write kernel parameter "))?;
     }
 
     Ok(())

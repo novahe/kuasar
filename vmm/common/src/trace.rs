@@ -63,7 +63,9 @@ pub fn setup_tracing(log_level: &str, otlp_service_name: &str) -> anyhow::Result
 fn init_logger_filter(log_level: &str) -> anyhow::Result<EnvFilter> {
     let filter = EnvFilter::from_default_env()
         .add_directive(format!("containerd_sandbox={}", log_level).parse()?)
-        .add_directive(format!("vmm_sandboxer={}", log_level).parse()?);
+        .add_directive(format!("vmm_sandboxer={}", log_level).parse()?)
+        .add_directive(format!("vmm_task={}", log_level).parse()?)
+        .add_directive(format!("vmm_common={}", log_level).parse()?);
     Ok(filter)
 }
 

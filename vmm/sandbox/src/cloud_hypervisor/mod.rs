@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{os::fd::OwnedFd, process::Stdio, time::Duration, time::Instant};
+use std::{os::fd::OwnedFd, process::Stdio, time::Duration};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -30,7 +30,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tracing::instrument;
-use vmm_common::SHARED_DIR_SUFFIX;
+use vmm_common::{nova_trace, SHARED_DIR_SUFFIX};
 
 use crate::{
     cloud_hypervisor::{
@@ -160,7 +160,7 @@ impl CloudHypervisorVM {
 impl VM for CloudHypervisorVM {
     #[instrument(skip_all)]
     async fn start(&mut self) -> Result<u32> {
-        let start = Instant::now();
+        nova_trace!("cloud hypervisor start", &self.id);
         create_dir_all(&self.base_dir).await?;
         let virtiofsd_pid = self.start_virtiofsd().await?;
         // TODO: add child virtiofsd process
@@ -215,11 +215,6 @@ impl VM for CloudHypervisorVM {
                 return Err(e);
             }
         }
-        info!(
-            "nova: cloud hypervisor start {} took {:?}",
-            self.id,
-            start.elapsed()
-        );
         Ok(pid.unwrap_or_default())
     }
 

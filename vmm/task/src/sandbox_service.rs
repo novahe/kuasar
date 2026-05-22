@@ -45,6 +45,7 @@ use vmm_common::{
             SyncClockPacket, UpdateInterfacesRequest, UpdateRoutesRequest,
         },
     },
+    nova_trace,
 };
 
 use crate::{netlink::Handle, sandbox::setup_sandbox, util::spawn_and_wait, NAMESPACE};
@@ -100,6 +101,7 @@ impl api::sandbox_ttrpc::SandboxService for SandboxService {
         _ctx: &TtrpcContext,
         req: SetupSandboxRequest,
     ) -> TtrpcResult<Empty> {
+        nova_trace!("task setup sandbox");
         match req.config.type_url.as_str() {
             "PodSandboxConfig" => {
                 let config =

@@ -22,7 +22,6 @@ use std::{
     },
     path::{Path, PathBuf},
     sync::Arc,
-    time::Instant,
 };
 
 use async_trait::async_trait;
@@ -49,7 +48,7 @@ use libcontainer::{
     signal::Signal,
     syscall::syscall::SyscallType,
 };
-use log::{debug, info, warn};
+use log::{debug, warn};
 use nix::{sys::signal::kill, unistd::Pid};
 use oci_spec::runtime::{LinuxResources, Process, Spec};
 use runc::io::{IOOption, Io, NullIo};
@@ -60,6 +59,7 @@ use tokio::{
     task::spawn_blocking,
 };
 use vmm_common::{
+    nova_trace,
     storage::{Storage, ANNOTATION_KEY_STORAGE},
     KUASAR_STATE_DIR,
 };
@@ -90,7 +90,7 @@ impl ContainerFactory<YoukiContainer> for YoukiFactory {
         _ns: &str,
         req: &CreateTaskRequest,
     ) -> containerd_shim::Result<YoukiContainer> {
-        let start = Instant::now();
+        nova_trace!("task create container", req.id());
         rescan_pci_bus().await?;
         let bundle = format!("{}/{}", KUASAR_STATE_DIR, req.id);
         let spec: Spec = read_spec(&bundle).await?;
@@ -100,6 +100,7 @@ impl ContainerFactory<YoukiContainer> for YoukiFactory {
         } else {
             read_storages(&bundle, req.id()).await?
         };
+
         self.sandbox
             .lock()
             .await
@@ -137,11 +138,6 @@ impl ContainerFactory<YoukiContainer> for YoukiFactory {
             },
             processes: Default::default(),
         };
-        info!(
-            "nova: task create container {} took {:?}",
-            req.id(),
-            start.elapsed()
-        );
         Ok(container)
     }
 
@@ -278,18 +274,13 @@ pub struct YoukiInitLifecycle {
 #[async_trait]
 impl ProcessLifecycle<InitProcess> for YoukiInitLifecycle {
     async fn start(&self, p: &mut InitProcess) -> containerd_shim::Result<()> {
-        let start = Instant::now();
         p.lifecycle
             .youki_container
             .lock()
             .await
             .start()
             .map_err(other_error!(e, "failed to start container "))?;
-        info!(
-            "nova: task start container {} took {:?}",
-            p.id,
-            start.elapsed()
-        );
+        nova_trace!("task start container", p.id);
         p.state = Status::RUNNING;
         Ok(())
     }
@@ -451,6 +442,7 @@ impl ProcessLifecycle<ExecProcess> for YoukiExecLifecycle {
                 copy_io_or_console(p, socket, pio, p.lifecycle.exit_signal.clone()).await?;
                 p.pid = pid.as_raw();
                 p.state = Status::RUNNING;
+                nova_trace!("task start exec", p.id);
             }
             Err(e) => {
                 if let Some(s) = socket {

@@ -47,9 +47,12 @@ use ttrpc::{
     context::with_timeout,
     r#async::{Client, TtrpcContext},
 };
-use vmm_common::api::{
-    sandbox::{CheckRequest, SetupSandboxRequest, SyncClockPacket},
-    sandbox_ttrpc::SandboxServiceClient,
+use vmm_common::{
+    api::{
+        sandbox::{CheckRequest, SetupSandboxRequest, SyncClockPacket},
+        sandbox_ttrpc::SandboxServiceClient,
+    },
+    nova_trace,
 };
 
 const HVSOCK_RETRY_TIMEOUT_IN_MS: u64 = 10;
@@ -270,6 +273,7 @@ pub fn unix_sock(r#abstract: bool, socket_path: &str) -> Result<UnixAddr> {
 }
 
 pub(crate) async fn client_check(client: &SandboxServiceClient, t_secs: u64) -> Result<()> {
+    nova_trace!("agent check successful");
     // the initial timeout is 1, and will grow exponentially
     let retry_timeout = 1;
 
