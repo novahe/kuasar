@@ -49,6 +49,7 @@ where
     T: VM + Sync + Send,
 {
     async fn handle(&self, sandbox: &mut KuasarSandbox<T>) -> Result<()> {
+        let t0 = std::time::Instant::now();
         let container = sandbox.container(&self.container_id).await?;
         let mounts = if let Some(c) = &container.data.spec {
             c.mounts.clone()
@@ -117,7 +118,15 @@ where
             "{}/{}-{}",
             container.data.bundle, STORAGE_FILE_PREFIX, self.container_id
         );
+        let t_write = std::time::Instant::now();
         write_file_atomic(&storage_file_path, &storage_str).await?;
+        log::info!(
+            "[StorageHandler] sandbox={} container={} write={}ms total={}ms",
+            sandbox.id,
+            self.container_id,
+            t_write.elapsed().as_millis(),
+            t0.elapsed().as_millis()
+        );
 
         container.data.rootfs = vec![];
         Ok(())

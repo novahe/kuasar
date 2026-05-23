@@ -44,12 +44,33 @@ where
     T: VM + Sync + Send,
 {
     async fn handle(&self, sandbox: &mut KuasarSandbox<T>) -> Result<()> {
+        let t0 = std::time::Instant::now();
         let mut io_devices = vec![];
         debug!("handle io {:?}", self.io);
         // TODO: what if it is not named pipe
         let stdin = attach_pipe(&self.io.stdin, sandbox, &mut io_devices).await?;
+        log::info!(
+            "[IoHandler] sandbox={} container={} attach_stdin={}ms",
+            sandbox.id,
+            self.container_id,
+            t0.elapsed().as_millis()
+        );
+        let t1 = std::time::Instant::now();
         let stdout = attach_pipe(&self.io.stdout, sandbox, &mut io_devices).await?;
+        log::info!(
+            "[IoHandler] sandbox={} container={} attach_stdout={}ms",
+            sandbox.id,
+            self.container_id,
+            t1.elapsed().as_millis()
+        );
+        let t2 = std::time::Instant::now();
         let stderr = attach_pipe(&self.io.stderr, sandbox, &mut io_devices).await?;
+        log::info!(
+            "[IoHandler] sandbox={} container={} attach_stderr={}ms",
+            sandbox.id,
+            self.container_id,
+            t2.elapsed().as_millis()
+        );
         let container = sandbox.container_mut(&self.container_id)?;
         container.data.io = Some(Io {
             stdin,
@@ -63,7 +84,15 @@ where
             "{}/{}-{}",
             container.data.bundle, IO_FILE_PREFIX, self.container_id
         );
+        let t3 = std::time::Instant::now();
         write_file_atomic(io_file_path, &io_str).await?;
+        log::info!(
+            "[IoHandler] sandbox={} container={} write_io_file={}ms total={}ms",
+            sandbox.id,
+            self.container_id,
+            t3.elapsed().as_millis(),
+            t0.elapsed().as_millis()
+        );
         container.io_devices = io_devices;
         Ok(())
     }

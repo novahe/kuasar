@@ -56,6 +56,7 @@ where
         &self,
         sandbox: &mut KuasarSandbox<T>,
     ) -> containerd_sandbox::error::Result<()> {
+        let t0 = std::time::Instant::now();
         let shared_path = sandbox.get_sandbox_shared_path();
         let container = sandbox.container_mut(&self.container_id)?;
         let spec = container
@@ -87,10 +88,20 @@ where
 
         // Update sandbox files mounts for container
         container_mounts(&shared_path, spec);
-        let spec_str = serde_json::to_string(spec)
+        let t_serialize = std::time::Instant::now();
+        let spec_str = serde_json::to_string(&spec)
             .map_err(|e| anyhow!("failed to parse spec in sandbox, {}", e))?;
         let config_path = format!("{}/{}", container.data.bundle, CONFIG_FILE_NAME);
+        let t_write = std::time::Instant::now();
         write_file_atomic(config_path, &spec_str).await?;
+        log::info!(
+            "[SpecHandler] sandbox={} container={} serialize={}us write={}ms total={}ms",
+            sandbox.id,
+            self.container_id,
+            t_serialize.elapsed().as_micros(),
+            t_write.elapsed().as_millis(),
+            t0.elapsed().as_millis()
+        );
         Ok(())
     }
 

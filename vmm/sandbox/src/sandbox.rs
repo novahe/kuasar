@@ -400,9 +400,34 @@ where
 
     #[instrument(skip_all)]
     async fn append_container(&mut self, id: &str, options: ContainerOption) -> Result<()> {
+        let t0 = std::time::Instant::now();
+        let sandbox_id = self.id.clone();
         let handler_chain = self.container_append_handlers(id, options)?;
+        info!(
+            "[append_container] sandbox={} container={} build_handlers={}us",
+            sandbox_id,
+            id,
+            t0.elapsed().as_micros()
+        );
+
+        let t1 = std::time::Instant::now();
         handler_chain.handle(self).await?;
+        info!(
+            "[append_container] sandbox={} container={} handler_chain={}ms",
+            sandbox_id,
+            id,
+            t1.elapsed().as_millis()
+        );
+
+        let t2 = std::time::Instant::now();
         self.dump().await?;
+        info!(
+            "[append_container] sandbox={} container={} dump={}ms total={}ms",
+            sandbox_id,
+            id,
+            t2.elapsed().as_millis(),
+            t0.elapsed().as_millis()
+        );
         Ok(())
     }
 
@@ -455,9 +480,13 @@ where
 {
     #[instrument(skip_all)]
     async fn dump(&self) -> Result<()> {
+        let t0 = std::time::Instant::now();
         let dump_data =
             serde_json::to_vec(&self).map_err(|e| anyhow!("failed to serialize sandbox, {}", e))?;
+        let serialize_us = t0.elapsed().as_micros();
+
         let dump_path = format!("{}/sandbox.json", self.base_dir);
+        let t1 = std::time::Instant::now();
         let mut dump_file = match OpenOptions::new()
             .write(true)
             .create(true)
@@ -478,6 +507,13 @@ where
             .write_all(dump_data.as_slice())
             .await
             .map_err(Error::IO)?;
+        info!(
+            "[dump] sandbox={} serialize={}us write={}ms total={}ms",
+            self.id,
+            serialize_us,
+            t1.elapsed().as_millis(),
+            t0.elapsed().as_millis()
+        );
         Ok(())
     }
 }

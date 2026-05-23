@@ -334,6 +334,7 @@ pub async fn write_file_async<P: AsRef<Path>>(path: P, s: &str) -> Result<()> {
 }
 
 pub async fn write_file_atomic<P: AsRef<Path>>(path: P, s: &str) -> Result<()> {
+    let t0 = std::time::Instant::now();
     let path = path.as_ref();
     let file = path
         .file_name()
@@ -365,7 +366,13 @@ pub async fn write_file_atomic<P: AsRef<Path>>(path: P, s: &str) -> Result<()> {
 
     tokio::fs::rename(tmp_path, path)
         .await
-        .map_err(|e| anyhow!("failed to rename file: {}", e).into())
+        .map_err(|e| anyhow!("failed to rename file: {}", e).into())?;
+    log::info!(
+        "[write_file_atomic] path={} elapsed={}ms",
+        path.display(),
+        t0.elapsed().as_millis()
+    );
+    Ok(())
 }
 
 pub fn bool_to_on_off(b: &bool) -> String {

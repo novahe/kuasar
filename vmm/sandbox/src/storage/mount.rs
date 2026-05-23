@@ -16,6 +16,7 @@ limitations under the License.
 
 use anyhow::anyhow;
 use containerd_sandbox::{error::Result, spec::Mount};
+use log::debug;
 use vmm_common::DEV_SHM;
 
 use crate::{storage::MountInfo, utils::read_file};
@@ -36,7 +37,11 @@ pub async fn get_mount_info(mount_point: &str) -> Result<Option<MountInfo>> {
     if mount_point.is_empty() {
         return Ok(None);
     }
+    let t0 = std::time::Instant::now();
     let mounts = read_file("/proc/mounts").await?;
+    let read_us = t0.elapsed().as_micros();
+    let mut found = false;
+    let mut result = None;
     for line in mounts.lines() {
         let fields = line.split_whitespace().collect::<Vec<&str>>();
         if fields.len() < 4 {
@@ -47,12 +52,21 @@ pub async fn get_mount_info(mount_point: &str) -> Result<Option<MountInfo>> {
         if mp == mount_point {
             let fs_type = fields[2].to_string();
             let options = fields[3].split(',').map(|x| x.to_string()).collect();
-            return Ok(Some(MountInfo {
+            found = true;
+            result = Some(MountInfo {
                 mount_point: mp,
                 fs_type,
                 options,
-            }));
+            });
+            break;
         }
     }
-    Ok(None)
+    log::info!(
+        "[get_mount_info] src={} read_proc_mounts={}us parse={}us found={}",
+        mount_point,
+        read_us,
+        t0.elapsed().as_micros().saturating_sub(read_us),
+        found
+    );
+    Ok(result)
 }

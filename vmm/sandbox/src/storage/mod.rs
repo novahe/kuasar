@@ -51,8 +51,13 @@ where
         m: &Mount,
         is_rootfs_mount: bool,
     ) -> Result<()> {
+        let t0 = std::time::Instant::now();
         if let Some(storage) = self.find_reusable_storage(m, is_rootfs_mount) {
             storage.refer(container_id);
+            log::info!(
+                "[attach_storage] sandbox={} container={} src={} reused=true elapsed={}us",
+                self.id, container_id, m.source, t0.elapsed().as_micros()
+            );
             return Ok(());
         }
 
@@ -62,12 +67,28 @@ where
             container_id, m, id
         );
 
-        if is_block_device(&*m.source).await? {
+        let t1 = std::time::Instant::now();
+        let is_block = is_block_device(&*m.source).await?;
+        log::info!(
+            "[attach_storage] sandbox={} container={} src={} is_block_check={}us",
+            self.id, container_id, m.source, t1.elapsed().as_micros()
+        );
+        if is_block {
             self.handle_block_device(&id, container_id, m).await?;
+            log::info!(
+                "[attach_storage] sandbox={} container={} src={} block_device total={}ms",
+                self.id, container_id, m.source, t0.elapsed().as_millis()
+            );
             return Ok(());
         }
+
         // handle tmpfs mount
+        let t2 = std::time::Instant::now();
         let mount_info = get_mount_info(&m.source).await?;
+        log::info!(
+            "[attach_storage] sandbox={} container={} src={} get_mount_info={}ms",
+            self.id, container_id, m.source, t2.elapsed().as_millis()
+        );
         if let Some(mi) = mount_info {
             // Only allow use tmpfs in emptyDir
             if mi.fs_type == "tmpfs" && mi.mount_point.contains("kubernetes.io~empty-dir") {
@@ -80,7 +101,12 @@ where
         }
 
         if is_bind(m) {
+            let t3 = std::time::Instant::now();
             self.handle_bind_mount(&id, container_id, m).await?;
+            log::info!(
+                "[attach_storage] sandbox={} container={} src={} bind_mount={}ms total={}ms",
+                self.id, container_id, m.source, t3.elapsed().as_millis(), t0.elapsed().as_millis()
+            );
             return Ok(());
         }
 
