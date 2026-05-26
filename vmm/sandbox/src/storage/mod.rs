@@ -482,6 +482,8 @@ mod tests {
             client: Default::default(),
             exit_signal: Default::default(),
             sandbox_cgroups: Default::default(),
+            cgroup_bind_cancelled: Default::default(),
+            cgroup_bind_handle: None,
         };
 
         // Validate reuse logic: a second rootfs attach should NOT reuse existing storage
@@ -537,6 +539,8 @@ mod tests {
             client: Default::default(),
             exit_signal: Default::default(),
             sandbox_cgroups: Default::default(),
+            cgroup_bind_cancelled: Default::default(),
+            cgroup_bind_handle: None,
         };
 
         // This should not fail even if the directory doesn't exist

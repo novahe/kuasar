@@ -33,66 +33,114 @@ pub const DEFAULT_CGROUP_PARENT_PATH: &str = "kuasar-vmm";
 pub const VCPU_CGROUP_NAME: &str = "vcpu";
 pub const POD_OVERHEAD_CGROUP_NAME: &str = "pod_overhead";
 
+#[derive(Default, Debug)]
+pub struct SandboxCgroupResources {
+    total: Option<LinuxContainerResources>,
+    containers: Option<LinuxContainerResources>,
+    overhead: Option<LinuxContainerResources>,
+}
+
+impl SandboxCgroupResources {
+    pub fn from_sandbox_data(data: &SandboxData) -> Self {
+        Self {
+            total: get_total_resources(data),
+            containers: get_resources(data).cloned(),
+            overhead: get_overhead_resources(data).cloned(),
+        }
+    }
+}
+
 /// `SandboxCgroup` represents a set of cgroups for a sandbox.
 #[derive(Default, Debug, Serialize, Deserialize)]
 pub struct SandboxCgroup {
     pub cgroup_parent_path: String,
     #[serde(skip)]
-    pub sandbox_cgroup: Cgroup,
+    pub sandbox_cgroup: Option<Cgroup>,
     #[serde(skip)]
-    pub vcpu_cgroup: Cgroup,
+    pub vcpu_cgroup: Option<Cgroup>,
     #[serde(skip)]
-    pub pod_overhead_cgroup: Cgroup,
+    pub pod_overhead_cgroup: Option<Cgroup>,
 }
 
 impl SandboxCgroup {
     pub fn create_sandbox_cgroups(cgroup_parent_path: &str, sandbox_id: &str) -> Result<Self> {
         // Create sandbox cgroup in the all cgroup subsystem dir
-        let sandbox_cgroup_path = format!("{}/{}", cgroup_parent_path, sandbox_id);
-        // CgroupBuilder::new() func doesn't accept the cgroup name has "/" prefix,
-        // So need to remove the "/" prefix for sandbox_cgroup_path
-        let sandbox_cgroup_rela_path = sandbox_cgroup_path.trim_start_matches('/');
+        let sandbox_cgroup_rela_path = sandbox_cgroup_relative_path(cgroup_parent_path, sandbox_id);
 
         let sandbox_cgroup =
-            CgroupBuilder::new(sandbox_cgroup_rela_path).build(cgroups_rs::hierarchies::auto())?;
+            CgroupBuilder::new(&sandbox_cgroup_rela_path).build(cgroups_rs::hierarchies::auto())?;
 
         // Only create the vcpu and pod_overhead cgroups in the cpu cgroup subsystem
-        let vcpu_cgroup_path = format!("{}/{}", sandbox_cgroup_rela_path, VCPU_CGROUP_NAME);
+        let vcpu_cgroup_path = format!("{}/{}", &sandbox_cgroup_rela_path, VCPU_CGROUP_NAME);
         let vcpu_cgroup = CgroupBuilder::new(vcpu_cgroup_path.as_str())
             .set_specified_controllers(vec!["cpu".to_string()])
             .build(cgroups_rs::hierarchies::auto())?;
 
         let pod_overhead_cgroup_path =
-            format!("{}/{}", sandbox_cgroup_rela_path, POD_OVERHEAD_CGROUP_NAME);
+            format!("{}/{}", &sandbox_cgroup_rela_path, POD_OVERHEAD_CGROUP_NAME);
         let pod_overhead_cgroup = CgroupBuilder::new(pod_overhead_cgroup_path.as_str())
             .set_specified_controllers(vec!["cpu".to_string()])
             .build(cgroups_rs::hierarchies::auto())?;
 
         Ok(SandboxCgroup {
             cgroup_parent_path: cgroup_parent_path.to_string(),
-            sandbox_cgroup,
-            vcpu_cgroup,
-            pod_overhead_cgroup,
+            sandbox_cgroup: Some(sandbox_cgroup),
+            vcpu_cgroup: Some(vcpu_cgroup),
+            pod_overhead_cgroup: Some(pod_overhead_cgroup),
         })
     }
 
-    pub fn update_res_for_sandbox_cgroups(&self, sandbox_data: &SandboxData) -> Result<()> {
-        // apply the total resources = sum(sum(containers_resources) + pod_overhead)) in the sandbox cgroup dir
-        if let Some(total_resources) = get_total_resources(sandbox_data) {
-            apply_cpu_resource(&self.sandbox_cgroup, &total_resources)?;
-            apply_memory_resource(&self.sandbox_cgroup, &total_resources)?;
-            apply_cpuset_resources(&self.sandbox_cgroup, &total_resources)?;
-            apply_hugetlb_resources(&self.sandbox_cgroup, &total_resources)?;
+    pub fn load_sandbox_cgroups(cgroup_parent_path: &str, sandbox_id: &str) -> Self {
+        let sandbox_cgroup_rela_path = sandbox_cgroup_relative_path(cgroup_parent_path, sandbox_id);
+        let sandbox_cgroup =
+            Cgroup::load(cgroups_rs::hierarchies::auto(), &sandbox_cgroup_rela_path);
+
+        let vcpu_cgroup_path = format!("{}/{}", &sandbox_cgroup_rela_path, VCPU_CGROUP_NAME);
+        let vcpu_cgroup = Cgroup::load_with_specified_controllers(
+            cgroups_rs::hierarchies::auto(),
+            vcpu_cgroup_path,
+            vec!["cpu".to_string()],
+        );
+
+        let pod_overhead_cgroup_path =
+            format!("{}/{}", &sandbox_cgroup_rela_path, POD_OVERHEAD_CGROUP_NAME);
+        let pod_overhead_cgroup = Cgroup::load_with_specified_controllers(
+            cgroups_rs::hierarchies::auto(),
+            pod_overhead_cgroup_path,
+            vec!["cpu".to_string()],
+        );
+
+        SandboxCgroup {
+            cgroup_parent_path: cgroup_parent_path.to_string(),
+            sandbox_cgroup: Some(sandbox_cgroup),
+            vcpu_cgroup: Some(vcpu_cgroup),
+            pod_overhead_cgroup: Some(pod_overhead_cgroup),
+        }
+    }
+
+    pub fn update_res_for_sandbox_cgroups(&self, resources: &SandboxCgroupResources) -> Result<()> {
+        if let Some(ref sandbox_cgroup) = self.sandbox_cgroup {
+            // apply the total resources = sum(sum(containers_resources) + pod_overhead)) in the sandbox cgroup dir
+            if let Some(total_resources) = resources.total.as_ref() {
+                apply_cpu_resource(sandbox_cgroup, total_resources)?;
+                apply_memory_resource(sandbox_cgroup, total_resources)?;
+                apply_cpuset_resources(sandbox_cgroup, total_resources)?;
+                apply_hugetlb_resources(sandbox_cgroup, total_resources)?;
+            }
         }
 
-        // apply the cpu resource of containers in the vcpu cpu subsystem cgroup
-        if let Some(containers_resources) = get_resources(sandbox_data) {
-            apply_cpu_resource(&self.vcpu_cgroup, containers_resources)?;
+        if let Some(ref vcpu_cgroup) = self.vcpu_cgroup {
+            // apply the cpu resource of containers in the vcpu cpu subsystem cgroup
+            if let Some(containers_resources) = resources.containers.as_ref() {
+                apply_cpu_resource(vcpu_cgroup, containers_resources)?;
+            }
         }
 
-        // apply the cpu resource of pod_overhead in the pod_overhead cpu subsystem cgroup
-        if let Some(overhead_resources) = get_overhead_resources(sandbox_data) {
-            apply_cpu_resource(&self.pod_overhead_cgroup, overhead_resources)?;
+        if let Some(ref pod_overhead_cgroup) = self.pod_overhead_cgroup {
+            // apply the cpu resource of pod_overhead in the pod_overhead cpu subsystem cgroup
+            if let Some(overhead_resources) = resources.overhead.as_ref() {
+                apply_cpu_resource(pod_overhead_cgroup, overhead_resources)?;
+            }
         }
 
         Ok(())
@@ -104,15 +152,20 @@ impl SandboxCgroup {
         vcpu_threads: Option<VcpuThreads>,
     ) -> Result<()> {
         // Add vmm process into the sandbox_cgroup
-        self.sandbox_cgroup.add_task_by_tgid((pid as u64).into())?;
-        self.pod_overhead_cgroup
-            .add_task_by_tgid((pid as u64).into())?;
+        if let Some(ref sandbox_cgroup) = self.sandbox_cgroup {
+            sandbox_cgroup.add_task_by_tgid((pid as u64).into())?;
+        }
+        if let Some(ref pod_overhead_cgroup) = self.pod_overhead_cgroup {
+            pod_overhead_cgroup.add_task_by_tgid((pid as u64).into())?;
+        }
 
         if let Some(all_vcpu_threads) = vcpu_threads {
-            // Move vmm process from parent sandbox cgroup into pod_overhead cgroup
-            // Then move the all vcpu threads of vmm process into vcpu cgroup
-            for (_, vcpu_thread_tid) in all_vcpu_threads.vcpus {
-                self.vcpu_cgroup.add_task((vcpu_thread_tid as u64).into())?;
+            if let Some(ref vcpu_cgroup) = self.vcpu_cgroup {
+                // Move vmm process from parent sandbox cgroup into pod_overhead cgroup
+                // Then move the all vcpu threads of vmm process into vcpu cgroup
+                for (_, vcpu_thread_tid) in all_vcpu_threads.vcpus {
+                    vcpu_cgroup.add_task((vcpu_thread_tid as u64).into())?;
+                }
             }
         }
 
@@ -120,11 +173,25 @@ impl SandboxCgroup {
     }
 
     pub fn remove_sandbox_cgroups(&self) -> Result<()> {
-        remove_sandbox_cgroup(&self.vcpu_cgroup)?;
-        remove_sandbox_cgroup(&self.pod_overhead_cgroup)?;
-        remove_sandbox_cgroup(&self.sandbox_cgroup)?;
+        if let Some(ref vcpu_cgroup) = self.vcpu_cgroup {
+            remove_sandbox_cgroup(vcpu_cgroup)?;
+        }
+        if let Some(ref pod_overhead_cgroup) = self.pod_overhead_cgroup {
+            remove_sandbox_cgroup(pod_overhead_cgroup)?;
+        }
+        if let Some(ref sandbox_cgroup) = self.sandbox_cgroup {
+            remove_sandbox_cgroup(sandbox_cgroup)?;
+        }
         Ok(())
     }
+}
+
+fn sandbox_cgroup_relative_path(cgroup_parent_path: &str, sandbox_id: &str) -> String {
+    // CgroupBuilder::new() func doesn't accept the cgroup name has "/" prefix,
+    // So need to remove the "/" prefix for sandbox_cgroup_path
+    format!("{}/{}", cgroup_parent_path, sandbox_id)
+        .trim_start_matches('/')
+        .to_string()
 }
 
 fn apply_cpu_resource(cgroup: &Cgroup, res: &LinuxContainerResources) -> Result<()> {
@@ -161,9 +228,13 @@ fn apply_memory_resource(cgroup: &Cgroup, res: &LinuxContainerResources) -> Resu
 }
 
 fn apply_cpuset_resources(cgroup: &Cgroup, res: &LinuxContainerResources) -> Result<()> {
+    if res.cpuset_cpus.is_empty() && res.cpuset_mems.is_empty() {
+        return Ok(());
+    }
+
     let cpuset_controller: &CpuSetController = cgroup
         .controller_of()
-        .ok_or_else(|| anyhow!("No cpuset controller attached!"))?;
+        .ok_or_else(|| anyhow!("cpuset resource specified but no cpuset controller attached!"))?;
 
     if !res.cpuset_cpus.is_empty() {
         cpuset_controller.set_cpus(&res.cpuset_cpus)?;
@@ -176,9 +247,14 @@ fn apply_cpuset_resources(cgroup: &Cgroup, res: &LinuxContainerResources) -> Res
 }
 
 fn apply_hugetlb_resources(cgroup: &Cgroup, res: &LinuxContainerResources) -> Result<()> {
+    if res.hugepage_limits.is_empty() {
+        return Ok(());
+    }
+
     let hugetlb_controller: &HugeTlbController = cgroup
         .controller_of()
-        .ok_or_else(|| anyhow!("No hugetlb controller attached!"))?;
+        .ok_or_else(|| anyhow!("hugetlb resource specified but no hugetlb controller attached!"))?;
+
     for h in res.hugepage_limits.iter() {
         hugetlb_controller.set_limit_in_bytes(h.page_size.as_str(), h.limit)?;
     }
@@ -221,6 +297,12 @@ mod tests {
 
     use super::*;
     use crate::utils::get_sandbox_cgroup_parent_path;
+
+    macro_rules! unwrap_cgroup {
+        ($cgroups:expr, $field:ident) => {
+            $cgroups.$field.as_ref().unwrap()
+        };
+    }
 
     fn create_mock_pod_sandbox_config() -> PodSandboxConfig {
         let mut pod_sandbox_config = PodSandboxConfig::default();
@@ -290,7 +372,9 @@ mod tests {
 
                 // check sandbox level cgroup
                 let sandbox_cgroup_cpu_controller: &CpuController =
-                    sandbox_cgoups.sandbox_cgroup.controller_of().unwrap();
+                    unwrap_cgroup!(sandbox_cgoups, sandbox_cgroup)
+                        .controller_of()
+                        .unwrap();
                 assert!(sandbox_cgroup_cpu_controller.path().exists());
                 assert_eq!(
                     sandbox_cgroup_cpu_controller.path(),
@@ -301,7 +385,9 @@ mod tests {
 
                 // check vcpu level cgroup
                 let vcpu_cgroup_cpu_controller: &CpuController =
-                    sandbox_cgoups.vcpu_cgroup.controller_of().unwrap();
+                    unwrap_cgroup!(sandbox_cgoups, vcpu_cgroup)
+                        .controller_of()
+                        .unwrap();
                 assert!(vcpu_cgroup_cpu_controller.path().exists());
                 assert_eq!(
                     vcpu_cgroup_cpu_controller.path(),
@@ -315,22 +401,43 @@ mod tests {
 
         // Case 3: If sandbox cgroups already exist in the system, then call create_sandbox_cgroups
         //         function again will not fail
-        let result = SandboxCgroup::create_sandbox_cgroups(&sandbox_cgroup_path, &sandbox_data.id);
-        match result {
-            Ok(sandbox_cgoups) => {
-                let sandbox_cgroup_mem_controller: &MemController =
-                    sandbox_cgoups.sandbox_cgroup.controller_of().unwrap();
-                assert!(sandbox_cgroup_mem_controller.path().exists());
-                assert_eq!(
-                    sandbox_cgroup_mem_controller.path().to_str().unwrap(),
-                    "/sys/fs/cgroup/memory/kubepods/burstable/podxxx/test_sandbox"
-                );
+        let cgroups =
+            SandboxCgroup::create_sandbox_cgroups("/kubepods/burstable/podxxx", "sandbox_id")
+                .unwrap();
+        let cpu_cgroup_root_pathbuf = cgroups_rs::hierarchies::V1::new()
+            .get_mount_point(cgroups_rs::Controllers::Cpu)
+            .unwrap();
+        let sandbox_cgroup_cpu_controller: &CpuController = unwrap_cgroup!(cgroups, sandbox_cgroup)
+            .controller_of()
+            .unwrap();
+        assert_eq!(
+            sandbox_cgroup_cpu_controller.path(),
+            cpu_cgroup_root_pathbuf
+                .join("kubepods/burstable/podxxx/sandbox_id")
+                .as_path()
+        );
+        let vcpu_cgroup_cpu_controller: &CpuController = unwrap_cgroup!(cgroups, vcpu_cgroup)
+            .controller_of()
+            .unwrap();
+        assert_eq!(
+            vcpu_cgroup_cpu_controller.path(),
+            cpu_cgroup_root_pathbuf
+                .join("kubepods/burstable/podxxx/sandbox_id/vcpu")
+                .as_path()
+        );
+        let pod_overhead_cgroup_cpu_controller: &CpuController =
+            unwrap_cgroup!(cgroups, pod_overhead_cgroup)
+                .controller_of()
+                .unwrap();
+        assert_eq!(
+            pod_overhead_cgroup_cpu_controller.path(),
+            cpu_cgroup_root_pathbuf
+                .join("kubepods/burstable/podxxx/sandbox_id/pod_overhead")
+                .as_path()
+        );
 
-                // Clean the test sandbox cgroups
-                assert_eq!(sandbox_cgoups.remove_sandbox_cgroups().is_ok(), true);
-            }
-            Err(e) => panic!("Expected an Ok, but got error: {}", e.to_string()),
-        }
+        // Clean the test sandbox cgroups
+        assert_eq!(cgroups.remove_sandbox_cgroups().is_ok(), true);
     }
 
     #[test]
@@ -350,21 +457,26 @@ mod tests {
         let sandbox_cgroup_path = get_sandbox_cgroup_parent_path(&sandbox_data).unwrap();
         let sandbox_cgroups =
             SandboxCgroup::create_sandbox_cgroups(&sandbox_cgroup_path, &sandbox_data.id).unwrap();
-        let result = sandbox_cgroups.update_res_for_sandbox_cgroups(&sandbox_data);
+        let resources = SandboxCgroupResources::from_sandbox_data(&sandbox_data);
+        let result = sandbox_cgroups.update_res_for_sandbox_cgroups(&resources);
 
         match result {
             Ok(_) => {
                 // Check sandbox level cgroup total resources
                 // Check cpu subsystem cgroup limit
                 let sandbox_cgroup_cpu_controller: &CpuController =
-                    sandbox_cgroups.sandbox_cgroup.controller_of().unwrap();
+                    unwrap_cgroup!(sandbox_cgroups, sandbox_cgroup)
+                        .controller_of()
+                        .unwrap();
                 assert_eq!(sandbox_cgroup_cpu_controller.cfs_period().unwrap(), 100000);
                 assert_eq!(sandbox_cgroup_cpu_controller.cfs_quota().unwrap(), 250000);
                 assert_eq!(sandbox_cgroup_cpu_controller.shares().unwrap(), 2048);
 
                 // Check memory subsystem cgroup limit
                 let sandbox_cgroup_mem_controller: &MemController =
-                    sandbox_cgroups.sandbox_cgroup.controller_of().unwrap();
+                    unwrap_cgroup!(sandbox_cgroups, sandbox_cgroup)
+                        .controller_of()
+                        .unwrap();
                 let memory_stats = sandbox_cgroup_mem_controller.memory_stat();
                 let memory_swap_stats = sandbox_cgroup_mem_controller.memswap();
                 assert_eq!(memory_stats.limit_in_bytes, 1124 * 1024 * 1024);
@@ -372,20 +484,21 @@ mod tests {
 
                 // Check cpuset subsystem cgroup limit
                 let sandbox_cgroup_cpuset_controller: &CpuSetController =
-                    sandbox_cgroups.sandbox_cgroup.controller_of().unwrap();
+                    unwrap_cgroup!(sandbox_cgroups, sandbox_cgroup)
+                        .controller_of()
+                        .unwrap();
                 let cpuset_stats = sandbox_cgroup_cpuset_controller.cpuset();
                 assert_eq!(cpuset_stats.cpus, vec![(0, 1)]);
                 assert_eq!(cpuset_stats.mems, vec![(0, 0)]);
 
                 // Check hugetlb subsystem cgroup limit
                 let sandbox_cgroup_hugetlb_controller: &HugeTlbController =
-                    sandbox_cgroups.sandbox_cgroup.controller_of().unwrap();
-                assert_eq!(
-                    sandbox_cgroup_hugetlb_controller
-                        .get_sizes()
-                        .contains(&"2MB".to_string()),
-                    true
-                );
+                    unwrap_cgroup!(sandbox_cgroups, sandbox_cgroup)
+                        .controller_of()
+                        .unwrap();
+                assert!(sandbox_cgroup_hugetlb_controller
+                    .get_sizes()
+                    .contains(&"2MB".to_string()));
                 assert_eq!(
                     sandbox_cgroup_hugetlb_controller
                         .limit_in_bytes("2MB")
@@ -395,14 +508,18 @@ mod tests {
 
                 // check vcpu level cgroup
                 let vcpu_cgroup_cpu_controller: &CpuController =
-                    sandbox_cgroups.vcpu_cgroup.controller_of().unwrap();
+                    unwrap_cgroup!(sandbox_cgroups, vcpu_cgroup)
+                        .controller_of()
+                        .unwrap();
                 assert_eq!(vcpu_cgroup_cpu_controller.cfs_period().unwrap(), 100000);
                 assert_eq!(vcpu_cgroup_cpu_controller.cfs_quota().unwrap(), 200000);
                 assert_eq!(vcpu_cgroup_cpu_controller.shares().unwrap(), 1024);
 
                 // check pod_overhead level cgroup
                 let pod_overhead_cgroup_cpu_controller: &CpuController =
-                    sandbox_cgroups.pod_overhead_cgroup.controller_of().unwrap();
+                    unwrap_cgroup!(sandbox_cgroups, pod_overhead_cgroup)
+                        .controller_of()
+                        .unwrap();
                 assert_eq!(
                     pod_overhead_cgroup_cpu_controller.cfs_period().unwrap(),
                     100000
@@ -417,5 +534,63 @@ mod tests {
         }
 
         assert_eq!(sandbox_cgroups.remove_sandbox_cgroups().is_ok(), true);
+    }
+
+    #[test]
+    fn test_empty_sandbox_cgroups_are_noop() {
+        let mut sandbox_data = SandboxData::default();
+        sandbox_data.id = String::from("test_sandbox");
+        sandbox_data.config = Some(create_mock_pod_sandbox_config());
+
+        let sandbox_cgroups = SandboxCgroup::default();
+        let resources = SandboxCgroupResources::from_sandbox_data(&sandbox_data);
+
+        assert!(sandbox_cgroups
+            .update_res_for_sandbox_cgroups(&resources)
+            .is_ok());
+        assert!(sandbox_cgroups
+            .add_process_into_sandbox_cgroups(
+                1,
+                Some(VcpuThreads {
+                    vcpus: HashMap::from([(0, 1)]),
+                }),
+            )
+            .is_ok());
+        assert!(sandbox_cgroups.remove_sandbox_cgroups().is_ok());
+    }
+
+    #[test]
+    fn test_load_sandbox_cgroups_does_not_create_missing_cgroups() {
+        // Currently only support cgroup V1, cgroup V2 is not supported now
+        if cgroups_rs::hierarchies::is_cgroup2_unified_mode() {
+            return;
+        }
+
+        let sandbox_id = format!(
+            "load_only_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let cgroup_parent_path = "/kubepods/burstable/podxxx";
+        let cgroups = SandboxCgroup::load_sandbox_cgroups(cgroup_parent_path, &sandbox_id);
+        let cpu_cgroup_root_pathbuf = cgroups_rs::hierarchies::V1::new()
+            .get_mount_point(cgroups_rs::Controllers::Cpu)
+            .unwrap();
+
+        let expected_sandbox_path = cpu_cgroup_root_pathbuf
+            .join("kubepods/burstable/podxxx")
+            .join(&sandbox_id);
+        let sandbox_cgroup_cpu_controller: &CpuController = unwrap_cgroup!(cgroups, sandbox_cgroup)
+            .controller_of()
+            .unwrap();
+
+        assert_eq!(sandbox_cgroup_cpu_controller.path(), expected_sandbox_path);
+        assert!(
+            !sandbox_cgroup_cpu_controller.path().exists(),
+            "load_sandbox_cgroups must not create missing cgroup directories"
+        );
     }
 }
