@@ -15,6 +15,7 @@
 */
 
 use std::{
+    future::Future,
     io::{ErrorKind, IoSliceMut},
     ops::Deref,
     os::{
@@ -48,6 +49,7 @@ use runc::io::{IOOption, NullIo, PipedIo, FIFO};
 use tokio::{
     fs::{File, OpenOptions},
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
+    time::{sleep, Duration},
 };
 use tokio_vsock::{VsockListener, VsockStream};
 
@@ -64,6 +66,13 @@ pub struct ProcessIO {
 
 const VSOCK: &str = "vsock";
 const STREAMING: &str = "streaming";
+const EXEC_IO_DRAIN_AFTER_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CopyMode {
+    Console,
+    Process,
+}
 
 #[cfg(not(feature = "youki"))]
 pub fn create_io(
@@ -181,6 +190,7 @@ pub async fn copy_console<P>(
             console_stdin,
             exit_signal.clone(),
             None::<fn()>,
+            CopyMode::Console,
         )
         .await?;
     }
@@ -196,6 +206,7 @@ pub async fn copy_console<P>(
             stdio.stdout.clone(),
             exit_signal,
             None::<fn()>,
+            CopyMode::Console,
         )
         .await?;
     }
@@ -213,20 +224,41 @@ pub async fn copy_io(pio: &ProcessIO, stdio: &Stdio, exit_signal: Arc<ExitSignal
         if let Some(w) = io.stdin() {
             debug!("copy_io: pipe stdin from {}", stdio.stdin.as_str());
             if !stdio.stdin.is_empty() {
-                spawn_copy_to(stdio.stdin.clone(), w, exit_signal.clone(), None::<fn()>).await?;
+                spawn_copy_to(
+                    stdio.stdin.clone(),
+                    w,
+                    exit_signal.clone(),
+                    None::<fn()>,
+                    CopyMode::Process,
+                )
+                .await?;
             }
         }
 
         if let Some(r) = io.stdout() {
             debug!("copy_io: pipe stdout from to {}", stdio.stdout.as_str());
             if !stdio.stdout.is_empty() {
-                spawn_copy_from(r, stdio.stdout.clone(), exit_signal.clone(), None::<fn()>).await?;
+                spawn_copy_from(
+                    r,
+                    stdio.stdout.clone(),
+                    exit_signal.clone(),
+                    None::<fn()>,
+                    CopyMode::Process,
+                )
+                .await?;
             }
         }
 
         if let Some(r) = io.stderr() {
             if !stdio.stderr.is_empty() {
-                spawn_copy_from(r, stdio.stderr.clone(), exit_signal.clone(), None::<fn()>).await?;
+                spawn_copy_from(
+                    r,
+                    stdio.stderr.clone(),
+                    exit_signal.clone(),
+                    None::<fn()>,
+                    CopyMode::Process,
+                )
+                .await?;
             }
         }
     }
@@ -239,6 +271,7 @@ async fn spawn_copy_from<R, F>(
     to: String,
     exit_signal: Arc<ExitSignal>,
     on_close: Option<F>,
+    mode: CopyMode,
 ) -> Result<()>
 where
     R: AsyncRead + Send + Unpin + 'static,
@@ -246,6 +279,9 @@ where
 {
     let src = from;
     tokio::spawn(async move {
+        // stdout/stderr direction: resolve destination first, then drain
+        // container output. Do not cancel hvsock accept on process exit:
+        // containerd may connect slightly after a fast command exits.
         let dst: Box<dyn AsyncWrite + Unpin + Send> = if to.contains(STREAMING) {
             match get_output(&to).await {
                 Ok(output) => Box::new(output),
@@ -255,19 +291,35 @@ where
                 }
             }
         } else if to.contains(VSOCK) {
-            tokio::select! {
-                _ = exit_signal.wait() => {
-                    debug!("container already exited, maybe nobody should connect vsock");
-                    return;
-                },
-                res = VsockIo::new(&to, true) => {
-                    match res {
-                        Ok(v) => Box::new(v),
-                        Err(e) => {
-                            error!("failed to new vsock {}, {:?}", to, e);
+            let vsock = match mode {
+                CopyMode::Console => {
+                    tokio::select! {
+                        _ = exit_signal.wait() => {
+                            debug!("container already exited, maybe nobody should connect vsock");
                             return;
                         },
+                        res = VsockIo::new(&to, true) => res,
                     }
+                }
+                CopyMode::Process => {
+                    match wait_for_after_exit(
+                        VsockIo::new(&to, true),
+                        exit_signal.clone(),
+                        EXEC_IO_DRAIN_AFTER_EXIT_TIMEOUT,
+                        "output vsock connection",
+                    )
+                    .await
+                    {
+                        Some(res) => res,
+                        None => return,
+                    }
+                }
+            };
+            match vsock {
+                Ok(v) => Box::new(v),
+                Err(e) => {
+                    error!("failed to new vsock {}, {:?}", to, e);
+                    return;
                 }
             }
         } else {
@@ -279,7 +331,18 @@ where
                 }
             }
         };
-        copy(src, dst, exit_signal, on_close).await;
+        if mode == CopyMode::Console {
+            copy(src, dst, exit_signal, on_close).await;
+        } else {
+            copy_until_eof_or_exit_drain(
+                src,
+                dst,
+                exit_signal,
+                EXEC_IO_DRAIN_AFTER_EXIT_TIMEOUT,
+                on_close,
+            )
+            .await;
+        }
         if to.contains(STREAMING) {
             remove_channel(&to).await.unwrap_or_default();
         }
@@ -293,6 +356,7 @@ async fn spawn_copy_to<W, F>(
     to: W,
     exit_signal: Arc<ExitSignal>,
     on_close: Option<F>,
+    mode: CopyMode,
 ) -> Result<()>
 where
     W: AsyncWrite + Send + Unpin + 'static,
@@ -300,6 +364,9 @@ where
 {
     let dst = to;
     tokio::spawn(async move {
+        // stdin direction: resolve source (guarded by exit_signal while waiting
+        // for the vsock connection), then copy to EOF and explicitly shutdown
+        // the container stdin pipe so programs like `cat > file` receive EOF.
         let src: Box<dyn AsyncRead + Unpin + Send> = if from.contains(STREAMING) {
             match get_stdin(&from).await {
                 Ok(stdin) => Box::new(stdin),
@@ -333,7 +400,11 @@ where
                 }
             }
         };
-        copy(src, dst, exit_signal, on_close).await;
+        if mode == CopyMode::Console {
+            copy(src, dst, exit_signal, on_close).await;
+        } else {
+            copy_until_eof_or_exit(src, dst, exit_signal, on_close).await;
+        }
         if from.contains(STREAMING) {
             remove_channel(&from).await.unwrap_or_default();
         }
@@ -353,13 +424,114 @@ where
             debug!("container exit, copy task should exit too");
         },
         res = io_copy(&mut src, &mut dst) => {
-           if let Err(e) = res {
-                error!("copy io failed {}", e);
-            }
+            log_copy_result(res);
         }
     }
     if let Some(f) = on_close {
         f();
+    }
+}
+
+async fn copy_until_eof_or_exit<R, W, F>(
+    mut src: R,
+    mut dst: W,
+    exit_signal: Arc<ExitSignal>,
+    on_close: Option<F>,
+) where
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+    F: FnOnce() + Send + 'static,
+{
+    tokio::select! {
+        _ = exit_signal.wait() => {
+            debug!("container exit before stdin EOF, shutting down stdin");
+        },
+        res = io_copy(&mut src, &mut dst) => {
+            log_copy_result(res);
+        }
+    }
+    shutdown_writer(&mut dst).await;
+    if let Some(f) = on_close {
+        f();
+    }
+}
+
+async fn copy_until_eof_or_exit_drain<R, W, F>(
+    mut src: R,
+    mut dst: W,
+    exit_signal: Arc<ExitSignal>,
+    drain_timeout: Duration,
+    on_close: Option<F>,
+) where
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+    F: FnOnce() + Send + 'static,
+{
+    let timed_out = tokio::select! {
+        res = io_copy(&mut src, &mut dst) => {
+            log_copy_result(res);
+            false
+        },
+        _ = async {
+            exit_signal.wait().await;
+            debug!("container exited, draining stdio for {:?}", drain_timeout);
+            sleep(drain_timeout).await;
+        } => {
+            debug!("stdio drain timed out after {:?}", drain_timeout);
+            true
+        }
+    };
+    if !timed_out {
+        shutdown_writer(&mut dst).await;
+    }
+    if let Some(f) = on_close {
+        f();
+    }
+}
+
+async fn wait_for_after_exit<F, T>(
+    future: F,
+    exit_signal: Arc<ExitSignal>,
+    after_exit_timeout: Duration,
+    waiting_for: &str,
+) -> Option<T>
+where
+    F: Future<Output = T>,
+{
+    tokio::select! {
+        res = future => Some(res),
+        _ = async {
+            exit_signal.wait().await;
+            debug!(
+                "container exited while waiting for {}, waiting {:?}",
+                waiting_for, after_exit_timeout
+            );
+            sleep(after_exit_timeout).await;
+        } => {
+            debug!("timed out waiting for {} after {:?}", waiting_for, after_exit_timeout);
+            None
+        },
+    }
+}
+
+async fn shutdown_writer<W>(dst: &mut W)
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    let _ = dst.flush().await;
+    let _ = dst.shutdown().await;
+}
+
+fn log_copy_result(result: std::io::Result<u64>) {
+    if let Err(e) = result {
+        if matches!(
+            e.kind(),
+            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof
+        ) {
+            debug!("copy io ended: {}", e);
+        } else {
+            error!("copy io failed: {}", e);
+        }
     }
 }
 
@@ -500,11 +672,12 @@ macro_rules! _do_poll_on_stream {
                     return Poll::Ready(Ok(t));
                 }
                 Err(e) => {
-                    if e.kind() == std::io::ErrorKind::BrokenPipe {
-                        *$this.stream = None;
-                    } else {
-                        return Poll::Ready(Err(e));
-                    }
+                    // exec stdio hvsock is a one-shot connection: once the
+                    // peer closes (BrokenPipe / ConnectionReset / UnexpectedEof)
+                    // we must propagate the error immediately and stop the copy.
+                    // Re-accepting a new connection here would cause the copy
+                    // loop to hang forever waiting for a caller that never comes.
+                    return Poll::Ready(Err(e));
                 }
             },
             Poll::Pending => {
@@ -587,5 +760,172 @@ impl VsockIo {
             vio.stream = Some(stream);
         }
         Ok(vio)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        future::pending,
+        io::Cursor,
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::{Context, Poll, Waker},
+    };
+
+    use tokio::io::AsyncWrite;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_output_drain_keeps_pending_write_after_exit() {
+        let exit_signal = Arc::new(ExitSignal::default());
+        let writer = GateWriter::new();
+
+        let copy_task = tokio::spawn(copy_until_eof_or_exit_drain(
+            Cursor::new(b"hello".to_vec()),
+            writer.clone(),
+            exit_signal.clone(),
+            Duration::from_millis(200),
+            None::<fn()>,
+        ));
+
+        writer.wait_until_pending().await;
+        exit_signal.signal();
+        writer.release();
+
+        copy_task.await.unwrap();
+        assert_eq!(writer.bytes(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn test_output_drain_times_out_pending_write_after_exit() {
+        let exit_signal = Arc::new(ExitSignal::default());
+        let writer = GateWriter::with_pending_flush();
+
+        let copy_task = tokio::spawn(copy_until_eof_or_exit_drain(
+            Cursor::new(b"hello".to_vec()),
+            writer.clone(),
+            exit_signal.clone(),
+            Duration::from_millis(10),
+            None::<fn()>,
+        ));
+
+        writer.wait_until_pending().await;
+        exit_signal.signal();
+
+        tokio::time::timeout(Duration::from_millis(200), copy_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(writer.bytes(), b"");
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_after_exit_times_out_pending_future() {
+        let exit_signal = Arc::new(ExitSignal::default());
+        exit_signal.signal();
+
+        let result = wait_for_after_exit(
+            pending::<usize>(),
+            exit_signal,
+            Duration::from_millis(10),
+            "test future",
+        )
+        .await;
+
+        assert!(result.is_none());
+    }
+
+    #[derive(Clone)]
+    struct GateWriter {
+        inner: Arc<Mutex<GateWriterState>>,
+    }
+
+    struct GateWriterState {
+        bytes: Vec<u8>,
+        pending_seen: bool,
+        released: bool,
+        pending_flush: bool,
+        waker: Option<Waker>,
+    }
+
+    impl GateWriter {
+        fn new() -> Self {
+            Self {
+                inner: Arc::new(Mutex::new(GateWriterState {
+                    bytes: Vec::new(),
+                    pending_seen: false,
+                    released: false,
+                    pending_flush: false,
+                    waker: None,
+                })),
+            }
+        }
+
+        fn with_pending_flush() -> Self {
+            Self {
+                inner: Arc::new(Mutex::new(GateWriterState {
+                    bytes: Vec::new(),
+                    pending_seen: false,
+                    released: false,
+                    pending_flush: true,
+                    waker: None,
+                })),
+            }
+        }
+
+        async fn wait_until_pending(&self) {
+            loop {
+                if self.inner.lock().unwrap().pending_seen {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+
+        fn release(&self) {
+            let waker = {
+                let mut state = self.inner.lock().unwrap();
+                state.released = true;
+                state.waker.take()
+            };
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            self.inner.lock().unwrap().bytes.clone()
+        }
+    }
+
+    impl AsyncWrite for GateWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let mut state = self.inner.lock().unwrap();
+            if !state.released {
+                state.pending_seen = true;
+                state.waker = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+
+            state.bytes.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            if self.inner.lock().unwrap().pending_flush {
+                return Poll::Pending;
+            }
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
     }
 }
