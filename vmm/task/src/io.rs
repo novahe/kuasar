@@ -15,7 +15,6 @@
 */
 
 use std::{
-    future::Future,
     io::{ErrorKind, IoSliceMut},
     ops::Deref,
     os::{
@@ -49,7 +48,7 @@ use runc::io::{IOOption, NullIo, PipedIo, FIFO};
 use tokio::{
     fs::{File, OpenOptions},
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
-    time::{sleep, Duration},
+    time::{timeout, Duration},
 };
 use tokio_vsock::{VsockListener, VsockStream};
 
@@ -67,12 +66,6 @@ pub struct ProcessIO {
 const VSOCK: &str = "vsock";
 const STREAMING: &str = "streaming";
 const EXEC_IO_DRAIN_AFTER_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum CopyMode {
-    Console,
-    Process,
-}
 
 #[cfg(not(feature = "youki"))]
 pub fn create_io(
@@ -190,7 +183,7 @@ pub async fn copy_console<P>(
             console_stdin,
             exit_signal.clone(),
             None::<fn()>,
-            CopyMode::Console,
+            true,
         )
         .await?;
     }
@@ -206,7 +199,7 @@ pub async fn copy_console<P>(
             stdio.stdout.clone(),
             exit_signal,
             None::<fn()>,
-            CopyMode::Console,
+            true,
         )
         .await?;
     }
@@ -229,7 +222,7 @@ pub async fn copy_io(pio: &ProcessIO, stdio: &Stdio, exit_signal: Arc<ExitSignal
                     w,
                     exit_signal.clone(),
                     None::<fn()>,
-                    CopyMode::Process,
+                    false,
                 )
                 .await?;
             }
@@ -243,7 +236,7 @@ pub async fn copy_io(pio: &ProcessIO, stdio: &Stdio, exit_signal: Arc<ExitSignal
                     stdio.stdout.clone(),
                     exit_signal.clone(),
                     None::<fn()>,
-                    CopyMode::Process,
+                    false,
                 )
                 .await?;
             }
@@ -256,7 +249,7 @@ pub async fn copy_io(pio: &ProcessIO, stdio: &Stdio, exit_signal: Arc<ExitSignal
                     stdio.stderr.clone(),
                     exit_signal.clone(),
                     None::<fn()>,
-                    CopyMode::Process,
+                    false,
                 )
                 .await?;
             }
@@ -271,7 +264,7 @@ async fn spawn_copy_from<R, F>(
     to: String,
     exit_signal: Arc<ExitSignal>,
     on_close: Option<F>,
-    mode: CopyMode,
+    terminal: bool,
 ) -> Result<()>
 where
     R: AsyncRead + Send + Unpin + 'static,
@@ -291,31 +284,7 @@ where
                 }
             }
         } else if to.contains(VSOCK) {
-            let vsock = match mode {
-                CopyMode::Console => {
-                    tokio::select! {
-                        _ = exit_signal.wait() => {
-                            debug!("container already exited, maybe nobody should connect vsock");
-                            return;
-                        },
-                        res = VsockIo::new(&to, true) => res,
-                    }
-                }
-                CopyMode::Process => {
-                    match wait_for_after_exit(
-                        VsockIo::new(&to, true),
-                        exit_signal.clone(),
-                        EXEC_IO_DRAIN_AFTER_EXIT_TIMEOUT,
-                        "output vsock connection",
-                    )
-                    .await
-                    {
-                        Some(res) => res,
-                        None => return,
-                    }
-                }
-            };
-            match vsock {
+            match VsockIo::new(&to, true).await {
                 Ok(v) => Box::new(v),
                 Err(e) => {
                     error!("failed to new vsock {}, {:?}", to, e);
@@ -331,7 +300,7 @@ where
                 }
             }
         };
-        if mode == CopyMode::Console {
+        if terminal {
             copy(src, dst, exit_signal, on_close).await;
         } else {
             copy_until_eof_or_exit_drain(
@@ -356,7 +325,7 @@ async fn spawn_copy_to<W, F>(
     to: W,
     exit_signal: Arc<ExitSignal>,
     on_close: Option<F>,
-    mode: CopyMode,
+    terminal: bool,
 ) -> Result<()>
 where
     W: AsyncWrite + Send + Unpin + 'static,
@@ -400,7 +369,7 @@ where
                 }
             }
         };
-        if mode == CopyMode::Console {
+        if terminal {
             copy(src, dst, exit_signal, on_close).await;
         } else {
             copy_until_eof_or_exit(src, dst, exit_signal, on_close).await;
@@ -467,50 +436,23 @@ async fn copy_until_eof_or_exit_drain<R, W, F>(
     W: AsyncWrite + Send + Unpin + 'static,
     F: FnOnce() + Send + 'static,
 {
-    let timed_out = tokio::select! {
+    let exit_first = tokio::select! {
         res = io_copy(&mut src, &mut dst) => {
             log_copy_result(res);
             false
         },
-        _ = async {
-            exit_signal.wait().await;
-            debug!("container exited, draining stdio for {:?}", drain_timeout);
-            sleep(drain_timeout).await;
-        } => {
-            debug!("stdio drain timed out after {:?}", drain_timeout);
-            true
-        }
+        _ = exit_signal.wait() => true,
     };
-    if !timed_out {
-        shutdown_writer(&mut dst).await;
+    if exit_first {
+        debug!("container exited, draining stdio for {:?}", drain_timeout);
+        match timeout(drain_timeout, io_copy(&mut src, &mut dst)).await {
+            Ok(res) => log_copy_result(res),
+            Err(_) => debug!("stdio drain timed out after {:?}", drain_timeout),
+        }
     }
+    shutdown_writer(&mut dst).await;
     if let Some(f) = on_close {
         f();
-    }
-}
-
-async fn wait_for_after_exit<F, T>(
-    future: F,
-    exit_signal: Arc<ExitSignal>,
-    after_exit_timeout: Duration,
-    waiting_for: &str,
-) -> Option<T>
-where
-    F: Future<Output = T>,
-{
-    tokio::select! {
-        res = future => Some(res),
-        _ = async {
-            exit_signal.wait().await;
-            debug!(
-                "container exited while waiting for {}, waiting {:?}",
-                waiting_for, after_exit_timeout
-            );
-            sleep(after_exit_timeout).await;
-        } => {
-            debug!("timed out waiting for {} after {:?}", waiting_for, after_exit_timeout);
-            None
-        },
     }
 }
 
@@ -760,172 +702,5 @@ impl VsockIo {
             vio.stream = Some(stream);
         }
         Ok(vio)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        future::pending,
-        io::Cursor,
-        pin::Pin,
-        sync::{Arc, Mutex},
-        task::{Context, Poll, Waker},
-    };
-
-    use tokio::io::AsyncWrite;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn test_output_drain_keeps_pending_write_after_exit() {
-        let exit_signal = Arc::new(ExitSignal::default());
-        let writer = GateWriter::new();
-
-        let copy_task = tokio::spawn(copy_until_eof_or_exit_drain(
-            Cursor::new(b"hello".to_vec()),
-            writer.clone(),
-            exit_signal.clone(),
-            Duration::from_millis(200),
-            None::<fn()>,
-        ));
-
-        writer.wait_until_pending().await;
-        exit_signal.signal();
-        writer.release();
-
-        copy_task.await.unwrap();
-        assert_eq!(writer.bytes(), b"hello");
-    }
-
-    #[tokio::test]
-    async fn test_output_drain_times_out_pending_write_after_exit() {
-        let exit_signal = Arc::new(ExitSignal::default());
-        let writer = GateWriter::with_pending_flush();
-
-        let copy_task = tokio::spawn(copy_until_eof_or_exit_drain(
-            Cursor::new(b"hello".to_vec()),
-            writer.clone(),
-            exit_signal.clone(),
-            Duration::from_millis(10),
-            None::<fn()>,
-        ));
-
-        writer.wait_until_pending().await;
-        exit_signal.signal();
-
-        tokio::time::timeout(Duration::from_millis(200), copy_task)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(writer.bytes(), b"");
-    }
-
-    #[tokio::test]
-    async fn test_wait_for_after_exit_times_out_pending_future() {
-        let exit_signal = Arc::new(ExitSignal::default());
-        exit_signal.signal();
-
-        let result = wait_for_after_exit(
-            pending::<usize>(),
-            exit_signal,
-            Duration::from_millis(10),
-            "test future",
-        )
-        .await;
-
-        assert!(result.is_none());
-    }
-
-    #[derive(Clone)]
-    struct GateWriter {
-        inner: Arc<Mutex<GateWriterState>>,
-    }
-
-    struct GateWriterState {
-        bytes: Vec<u8>,
-        pending_seen: bool,
-        released: bool,
-        pending_flush: bool,
-        waker: Option<Waker>,
-    }
-
-    impl GateWriter {
-        fn new() -> Self {
-            Self {
-                inner: Arc::new(Mutex::new(GateWriterState {
-                    bytes: Vec::new(),
-                    pending_seen: false,
-                    released: false,
-                    pending_flush: false,
-                    waker: None,
-                })),
-            }
-        }
-
-        fn with_pending_flush() -> Self {
-            Self {
-                inner: Arc::new(Mutex::new(GateWriterState {
-                    bytes: Vec::new(),
-                    pending_seen: false,
-                    released: false,
-                    pending_flush: true,
-                    waker: None,
-                })),
-            }
-        }
-
-        async fn wait_until_pending(&self) {
-            loop {
-                if self.inner.lock().unwrap().pending_seen {
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        }
-
-        fn release(&self) {
-            let waker = {
-                let mut state = self.inner.lock().unwrap();
-                state.released = true;
-                state.waker.take()
-            };
-            if let Some(waker) = waker {
-                waker.wake();
-            }
-        }
-
-        fn bytes(&self) -> Vec<u8> {
-            self.inner.lock().unwrap().bytes.clone()
-        }
-    }
-
-    impl AsyncWrite for GateWriter {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<std::io::Result<usize>> {
-            let mut state = self.inner.lock().unwrap();
-            if !state.released {
-                state.pending_seen = true;
-                state.waker = Some(cx.waker().clone());
-                return Poll::Pending;
-            }
-
-            state.bytes.extend_from_slice(buf);
-            Poll::Ready(Ok(buf.len()))
-        }
-
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            if self.inner.lock().unwrap().pending_flush {
-                return Poll::Pending;
-            }
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
     }
 }
