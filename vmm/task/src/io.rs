@@ -41,6 +41,7 @@ use nix::{
         socket::{recvmsg, ControlMessageOwned, MsgFlags, UnixAddr},
         termios::tcgetattr,
     },
+    unistd::pipe,
 };
 use runc::io::Io;
 #[cfg(not(feature = "youki"))]
@@ -143,7 +144,7 @@ pub(crate) async fn copy_io_or_console<P>(
             }
         }
     } else if let Some(pio) = pio {
-        copy_io(&pio, &p.stdio, exit_signal).await?;
+        copy_io(&pio, &p.stdio, exit_signal, Some(p.stdin.clone())).await?;
     }
     Ok(())
 }
@@ -161,16 +162,24 @@ pub async fn copy_console<P>(
     if !stdio.stdin.is_empty() {
         debug!("copy_console: pipe stdin to console");
 
-        let stdin_clone = stdio.stdin.clone();
-        let stdin_w = p.stdin.clone();
-        // open the write side to make sure read side unblock, as open write side
-        // will block too, open it in another thread
-        tokio::spawn(async move {
-            if let Ok(stdin_file) = OpenOptions::new().write(true).open(stdin_clone).await {
-                let mut lock_guard = stdin_w.lock().await;
-                *lock_guard = Some(stdin_file);
-            }
-        });
+        let close_signal = if stdio.stdin.contains(STREAMING) {
+            let (close_reader, close_writer) = new_stdin_close_signal()?;
+            let mut lock_guard = p.stdin.lock().await;
+            *lock_guard = Some(close_writer);
+            Some(Box::new(close_reader) as Box<dyn AsyncRead + Unpin + Send>)
+        } else {
+            let stdin_clone = stdio.stdin.clone();
+            let stdin_w = p.stdin.clone();
+            // open the write side to make sure read side unblock, as open write side
+            // will block too, open it in another thread
+            tokio::spawn(async move {
+                if let Ok(stdin_file) = OpenOptions::new().write(true).open(stdin_clone).await {
+                    let mut lock_guard = stdin_w.lock().await;
+                    *lock_guard = Some(stdin_file);
+                }
+            });
+            None
+        };
 
         let console_stdin = f
             .try_clone()
@@ -180,6 +189,7 @@ pub async fn copy_console<P>(
             stdio.stdin.clone(),
             console_stdin,
             exit_signal.clone(),
+            close_signal,
             None::<fn()>,
         )
         .await?;
@@ -205,7 +215,12 @@ pub async fn copy_console<P>(
     Ok(console)
 }
 
-pub async fn copy_io(pio: &ProcessIO, stdio: &Stdio, exit_signal: Arc<ExitSignal>) -> Result<()> {
+pub async fn copy_io(
+    pio: &ProcessIO,
+    stdio: &Stdio,
+    exit_signal: Arc<ExitSignal>,
+    stdin_close: Option<Arc<tokio::sync::Mutex<Option<File>>>>,
+) -> Result<()> {
     if !pio.copy {
         return Ok(());
     };
@@ -213,7 +228,23 @@ pub async fn copy_io(pio: &ProcessIO, stdio: &Stdio, exit_signal: Arc<ExitSignal
         if let Some(w) = io.stdin() {
             debug!("copy_io: pipe stdin from {}", stdio.stdin.as_str());
             if !stdio.stdin.is_empty() {
-                spawn_copy_to(stdio.stdin.clone(), w, exit_signal.clone(), None::<fn()>).await?;
+                let close_signal = match stdin_close.as_ref() {
+                    Some(stdin_close) => {
+                        let (close_reader, close_writer) = new_stdin_close_signal()?;
+                        let mut lock_guard = stdin_close.lock().await;
+                        *lock_guard = Some(close_writer);
+                        Some(Box::new(close_reader) as Box<dyn AsyncRead + Unpin + Send>)
+                    }
+                    None => None,
+                };
+                spawn_copy_to(
+                    stdio.stdin.clone(),
+                    w,
+                    exit_signal.clone(),
+                    close_signal,
+                    None::<fn()>,
+                )
+                .await?;
             }
         }
 
@@ -232,6 +263,14 @@ pub async fn copy_io(pio: &ProcessIO, stdio: &Stdio, exit_signal: Arc<ExitSignal
     }
 
     Ok(())
+}
+
+fn new_stdin_close_signal() -> Result<(File, File)> {
+    let (read_fd, write_fd) =
+        pipe().map_err(|e| other!("failed to create stdin close signal pipe: {}", e))?;
+    let read_file = unsafe { std::fs::File::from_raw_fd(read_fd.into_raw_fd()) };
+    let write_file = unsafe { std::fs::File::from_raw_fd(write_fd.into_raw_fd()) };
+    Ok((File::from_std(read_file), File::from_std(write_file)))
 }
 
 async fn spawn_copy_from<R, F>(
@@ -279,7 +318,7 @@ where
                 }
             }
         };
-        copy(src, dst, exit_signal, on_close).await;
+        copy(src, dst, exit_signal, None, on_close).await;
         if to.contains(STREAMING) {
             remove_channel(&to).await.unwrap_or_default();
         }
@@ -292,6 +331,7 @@ async fn spawn_copy_to<W, F>(
     from: String,
     to: W,
     exit_signal: Arc<ExitSignal>,
+    close_signal: Option<Box<dyn AsyncRead + Unpin + Send>>,
     on_close: Option<F>,
 ) -> Result<()>
 where
@@ -333,7 +373,7 @@ where
                 }
             }
         };
-        copy(src, dst, exit_signal, on_close).await;
+        copy(src, dst, exit_signal, close_signal, on_close).await;
         if from.contains(STREAMING) {
             remove_channel(&from).await.unwrap_or_default();
         }
@@ -342,25 +382,51 @@ where
     Ok(())
 }
 
-async fn copy<R, W, F>(mut src: R, mut dst: W, exit_signal: Arc<ExitSignal>, on_close: Option<F>)
-where
+async fn copy<R, W, F>(
+    mut src: R,
+    mut dst: W,
+    exit_signal: Arc<ExitSignal>,
+    close_signal: Option<Box<dyn AsyncRead + Unpin + Send>>,
+    on_close: Option<F>,
+) where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
     F: FnOnce() + Send + 'static,
 {
-    tokio::select! {
-        _ = exit_signal.wait() => {
-            debug!("container exit, copy task should exit too");
-        },
-        res = io_copy(&mut src, &mut dst) => {
-           if let Err(e) = res {
-                error!("copy io failed {}", e);
+    if let Some(mut close_signal) = close_signal {
+        tokio::select! {
+            _ = exit_signal.wait() => {
+                debug!("container exit, copy task should exit too");
+            },
+            _ = wait_for_close_signal(close_signal.as_mut()) => {
+                debug!("stdin close requested, copy task should exit too");
+            },
+            res = io_copy(&mut src, &mut dst) => {
+                if let Err(e) = res {
+                    error!("copy io failed {}", e);
+                }
+            }
+        }
+    } else {
+        tokio::select! {
+            _ = exit_signal.wait() => {
+                debug!("container exit, copy task should exit too");
+            },
+            res = io_copy(&mut src, &mut dst) => {
+                if let Err(e) = res {
+                    error!("copy io failed {}", e);
+                }
             }
         }
     }
     if let Some(f) = on_close {
         f();
     }
+}
+
+async fn wait_for_close_signal(signal: &mut (dyn AsyncRead + Unpin + Send)) {
+    let mut buf = [0u8; 1];
+    let _ = signal.read(&mut buf).await;
 }
 
 async fn io_copy<'a, R, W>(src: &'a mut R, dst: &'a mut W) -> std::io::Result<u64>

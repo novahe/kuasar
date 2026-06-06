@@ -171,7 +171,7 @@ impl ContainerFactory<KuasarContainer> for KuasarFactory {
             verify_orphan_alive(id, adoption.orphan_pid, &orphan_container_id)?;
             let mut init = InitProcess::new(
                 id,
-                Stdio::default(),
+                Stdio::new("", "", "", false),
                 KuasarInitLifecycle::new_adopted(
                     runc.clone(),
                     opts.clone(),
