@@ -44,7 +44,7 @@ use crate::{
     device::{DeviceInfo, PhysicalDeviceInfo, TapDeviceInfo, VhostUserDeviceInfo},
     network::{
         address::{CniIPAddress, IpNet, MacAddress},
-        create_netlink_handle, execute_in_netns, run_in_new_netns,
+        create_netlink_handle, run_in_new_netns,
     },
     sandbox::KuasarSandbox,
     utils::write_file_async,
@@ -316,10 +316,7 @@ impl NetworkInterface {
                 let tap_name = format!("tap_kua_{}", self.index);
                 let tap_intf =
                     create_tap_in_netns(netns, &tap_name, self.queue, self.mtu, &handle).await?;
-                tap_intf.add_qdisc_ingress(netns, &handle).await?;
-                self.add_qdisc_ingress(netns, &handle).await?;
-                tap_intf.add_redirect_tc_filter(netns, &self.name).await?;
-                self.add_redirect_tc_filter(netns, &tap_intf.name).await?;
+                configure_veth_tap_redirects(&handle, self.index, tap_intf.index).await?;
                 self.twin = Some(Box::new(tap_intf));
             }
             LinkType::Physical(bdf, _driver) => {
@@ -394,41 +391,55 @@ impl NetworkInterface {
         Ok(())
     }
 
-    async fn add_qdisc_ingress(&self, netns: &str, _handle: &Handle) -> Result<()> {
-        // TODO use netlink to add ingress
-        let mut cmd = std::process::Command::new("tc");
-        cmd.args(["qdisc", "add", "dev", &*self.name, "ingress"]);
-        execute_in_netns(netns, cmd).await?;
-        Ok(())
-    }
+}
 
-    async fn add_redirect_tc_filter(&self, netns: &str, dest: &str) -> Result<()> {
-        // TODO do this with netlink library
-        let mut cmd = std::process::Command::new("tc");
-        cmd.args([
-            "filter",
-            "add",
-            "dev",
-            &*self.name,
-            "parent",
-            "ffff:",
-            "protocol",
-            "all",
-            "u32",
-            "match",
-            "u8",
-            "0",
-            "0",
-            "action",
-            "mirred",
-            "egress",
-            "redirect",
-            "dev",
-            dest,
-        ]);
-        execute_in_netns(netns, cmd).await?;
-        Ok(())
-    }
+const TC_PARENT_INGRESS: u32 = 0xffff0000;
+const ETH_P_ALL: u16 = 0x0003;
+
+async fn configure_veth_tap_redirects(
+    handle: &Handle,
+    veth_index: u32,
+    tap_index: u32,
+) -> Result<()> {
+    handle
+        .qdisc()
+        .add(tap_index as i32)
+        .ingress()
+        .execute()
+        .await
+        .map_err(|e| anyhow!("failed to add tap ingress qdisc: {}", e))?;
+
+    handle
+        .qdisc()
+        .add(veth_index as i32)
+        .ingress()
+        .execute()
+        .await
+        .map_err(|e| anyhow!("failed to add veth ingress qdisc: {}", e))?;
+
+    handle
+        .traffic_filter(tap_index as i32)
+        .add()
+        .parent(TC_PARENT_INGRESS)
+        .protocol(ETH_P_ALL)
+        .redirect(veth_index)
+        .map_err(|e| anyhow!("failed to build traffic_filter redirect tap to veth: {}", e))?
+        .execute()
+        .await
+        .map_err(|e| anyhow!("failed to execute traffic_filter redirect tap to veth: {}", e))?;
+
+    handle
+        .traffic_filter(veth_index as i32)
+        .add()
+        .parent(TC_PARENT_INGRESS)
+        .protocol(ETH_P_ALL)
+        .redirect(tap_index)
+        .map_err(|e| anyhow!("failed to build traffic_filter redirect veth to tap: {}", e))?
+        .execute()
+        .await
+        .map_err(|e| anyhow!("failed to execute traffic_filter redirect veth to tap: {}", e))?;
+
+    Ok(())
 }
 
 fn get_bdf_for_eth(if_name: &str) -> Result<String> {
@@ -647,5 +658,84 @@ mod tests {
             .args(["tuntap", "del", tap_name])
             .output()
             .expect("failed to delete tap dev");
+    }
+
+    #[test]
+    fn test_tc_constants_for_netlink() {
+        use super::{TC_PARENT_INGRESS, ETH_P_ALL};
+        assert_eq!(TC_PARENT_INGRESS, 0xffff0000, "TC_PARENT_INGRESS must be 0xffff0000 (ffff:)");
+        assert_eq!(ETH_P_ALL, 0x0003, "ETH_P_ALL must be 0x0003");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root privileges and iproute2"]
+    async fn test_netlink_redirect() {
+        use super::configure_veth_tap_redirects;
+        use crate::network::create_netlink_handle;
+        use std::process::Command;
+        
+        let netns_name = "test_redir_ns";
+        let netns_path = format!("/var/run/netns/{}", netns_name);
+        
+        // Clean up previous run if failed
+        let _ = Command::new("ip").args(["netns", "del", netns_name]).output();
+        
+        let out = match Command::new("ip").args(["netns", "add", netns_name]).output() {
+            Ok(o) => o,
+            Err(_) => panic!("ip command not found, test_netlink_redirect requires iproute2"),
+        };
+        if !out.status.success() {
+            panic!("No root permission or failed to create netns, test_netlink_redirect requires root privileges");
+        }
+        
+        let handle = create_netlink_handle(&netns_path).await.expect("failed to create netlink handle");
+        
+        Command::new("ip").args(["netns", "exec", netns_name, "ip", "link", "add", "veth_t", "type", "veth", "peer", "name", "veth_p"])
+            .output().expect("failed to create veth");
+            
+        Command::new("ip").args(["netns", "exec", netns_name, "ip", "link", "set", "veth_t", "up"])
+            .output().unwrap();
+            
+        Command::new("ip").args(["netns", "exec", netns_name, "ip", "tuntap", "add", "dev", "tap_t", "mode", "tap"])
+            .output().expect("failed to create tap");
+            
+        Command::new("ip").args(["netns", "exec", netns_name, "ip", "link", "set", "tap_t", "up"])
+            .output().unwrap();
+            
+        let get_ifindex = |name: &str| -> u32 {
+            let out = Command::new("ip").args(["netns", "exec", netns_name, "cat", &format!("/sys/class/net/{}/ifindex", name)])
+                .output().unwrap().stdout;
+            let s = std::str::from_utf8(&out).unwrap().trim();
+            s.parse().unwrap()
+        };
+        
+        let veth_index = get_ifindex("veth_t");
+        let tap_index = get_ifindex("tap_t");
+        
+        configure_veth_tap_redirects(&handle, veth_index, tap_index).await.expect("failed to configure netlink");
+        
+        let qdisc_out = Command::new("ip").args(["netns", "exec", netns_name, "tc", "qdisc", "show", "dev", "veth_t"])
+            .output().unwrap().stdout;
+        let qdisc_str = std::str::from_utf8(&qdisc_out).unwrap();
+        assert!(qdisc_str.contains("ingress"), "veth_t should have ingress qdisc");
+        
+        let qdisc_out2 = Command::new("ip").args(["netns", "exec", netns_name, "tc", "qdisc", "show", "dev", "tap_t"])
+            .output().unwrap().stdout;
+        let qdisc_str2 = std::str::from_utf8(&qdisc_out2).unwrap();
+        assert!(qdisc_str2.contains("ingress"), "tap_t should have ingress qdisc");
+        
+        let filter_out = Command::new("ip").args(["netns", "exec", netns_name, "tc", "filter", "show", "dev", "veth_t", "parent", "ffff:"])
+            .output().unwrap().stdout;
+        let filter_str = std::str::from_utf8(&filter_out).unwrap();
+        assert!(filter_str.contains("mirred") && filter_str.contains("redirect") && filter_str.contains("tap_t"), 
+            "veth_t filter should redirect to tap_t");
+            
+        let filter_out2 = Command::new("ip").args(["netns", "exec", netns_name, "tc", "filter", "show", "dev", "tap_t", "parent", "ffff:"])
+            .output().unwrap().stdout;
+        let filter_str2 = std::str::from_utf8(&filter_out2).unwrap();
+        assert!(filter_str2.contains("mirred") && filter_str2.contains("redirect") && filter_str2.contains("veth_t"), 
+            "tap_t filter should redirect to veth_t");
+            
+        Command::new("ip").args(["netns", "del", netns_name]).output().unwrap();
     }
 }

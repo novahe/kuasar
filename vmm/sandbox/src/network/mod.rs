@@ -211,27 +211,6 @@ pub(crate) async fn create_netlink_handle(netns: &str) -> Result<Handle> {
     Ok(handle)
 }
 
-pub async fn execute_in_netns(netns: &str, mut cmd: std::process::Command) -> Result<String> {
-    let output = if !netns.is_empty() {
-        run_in_new_netns(netns, move || cmd.output()).await?
-    } else {
-        cmd.output()
-    }?;
-    if !output.status.success() {
-        Err(anyhow!(
-            "failed to execute command, command return {:?}, stdout: {}, stderr: {}",
-            output.status.code(),
-            String::from_utf8_lossy(output.stdout.as_slice()),
-            String::from_utf8_lossy(output.stderr.as_slice())
-        )
-        .into())
-    } else {
-        let stdout = String::from_utf8(output.stdout)
-            .map_err(|e| anyhow!("failed to execute command: {}", e))?;
-        Ok(stdout)
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NetType {
     Tap,
